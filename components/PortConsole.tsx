@@ -86,6 +86,10 @@ export function PortConsole() {
   );
 
   const joinByCode = useCallback(() => {
+    if (!name.trim()) {
+      setError('Enter a nickname before joining a room');
+      return;
+    }
     const clean = code.toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (clean.length < 4) {
       setError('Enter the room code your opponent sent you');
@@ -119,8 +123,9 @@ export function PortConsole() {
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
+              required
               maxLength={18}
-              placeholder="Unnamed"
+              placeholder="Enter your nickname"
               className="mt-2 w-full border border-brass/30 bg-abyss/60 px-3 py-2.5 font-mono text-[13px] tracking-[0.1em] text-parchment placeholder:text-parchment/25 focus:border-brass/70 focus:outline-none"
             />
           </label>
@@ -148,14 +153,14 @@ export function PortConsole() {
             <Btn
               tone="primary"
               onClick={() => void run('quick', () => quickMatch(name, mode))}
-              disabled={busy !== null}
+              disabled={busy !== null || !name.trim()}
               className="w-full py-3.5 text-[10.5px]"
             >
               {busy === 'quick' ? 'Finding an opponent…' : 'Quick match'}
             </Btn>
             <Btn
               onClick={() => void run('create', () => createRoom(name, { mode }))}
-              disabled={busy !== null}
+              disabled={busy !== null || !name.trim()}
               className="w-full py-3.5 text-[10.5px]"
             >
               {busy === 'create' ? 'Opening room…' : `Create private room${mode === 'duo' ? ' (2v2)' : ''}`}
@@ -180,7 +185,7 @@ export function PortConsole() {
               aria-label="Room code"
               className="min-w-0 flex-1 border border-brass/30 bg-abyss/60 px-3 py-2.5 font-mono text-[15px] tracking-[0.3em] text-flare uppercase placeholder:text-parchment/20 focus:border-brass/70 focus:outline-none"
             />
-            <Btn onClick={joinByCode} disabled={busy !== null} className="shrink-0 px-5">
+            <Btn onClick={joinByCode} disabled={busy !== null || !name.trim()} className="shrink-0 px-5">
               {busy === 'join' ? 'Joining…' : 'Join'}
             </Btn>
           </div>
@@ -188,6 +193,9 @@ export function PortConsole() {
           <div className="mt-7 border-t border-brass/15 pt-5 text-center">
             <Btn onClick={() => router.push('/solo')} disabled={busy !== null}>
               Solo drill vs the machine
+            </Btn>
+            <Btn onClick={() => router.push('/solo?mode=duo')} disabled={busy !== null} className="ml-2">
+              2v2 with bots
             </Btn>
           </div>
 

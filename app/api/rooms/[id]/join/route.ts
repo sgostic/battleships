@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 import { cleanName, join, sideForToken, viewFor } from '@/lib/game/match';
-import { jsonError, readJson, readToken, resolveRoomId } from '@/lib/net/api';
+import { jsonError, readJson, readToken, requiredName, resolveRoomId } from '@/lib/net/api';
 import { dequeueRoom, mutateRoom, newPlayerToken } from '@/lib/net/rooms';
 
 export const dynamic = 'force-dynamic';
@@ -12,13 +12,15 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const roomId = await resolveRoomId(ctx);
   const body = await readJson(request);
+  const name = requiredName(body);
+  if (name instanceof Response) return name;
   const existingToken = readToken(request) ?? (typeof body.token === 'string' ? body.token : null);
   const token = existingToken || newPlayerToken();
 
   const outcome = await mutateRoom(roomId, (state) => {
     const already = sideForToken(state, token);
     if (already) return { ok: true as const, value: already };
-    return join(state, token, cleanName(body.name, state.players.a ? 'b' : 'a'), Date.now());
+    return join(state, token, cleanName(name, state.players.a ? 'b' : 'a'), Date.now());
   });
 
   if (!outcome.ok) return jsonError(outcome.error, outcome.code);

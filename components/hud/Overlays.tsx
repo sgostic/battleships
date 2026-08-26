@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import type { Team } from '@/lib/game/match';
+import type { SeatView, Side, Team } from '@/lib/game/match';
 import { Btn } from './Btn';
 
 function Shell({ label, children }: { label: string; children: React.ReactNode }) {
@@ -73,6 +73,33 @@ export function StandbyOverlay({ message }: { message: string }) {
     <div className="pointer-events-none absolute bottom-24 left-1/2 -translate-x-1/2 animate-sb-fade border border-brass/30 bg-[rgba(8,22,28,.82)] px-5 py-3 backdrop-blur-md">
       <p className="stencil animate-sb-pulse text-parchment/70">{message}</p>
     </div>
+  );
+}
+
+/** A one-time 2v2-only decision. The engine has already selected its recipient. */
+export function SpecialMoveOverlay({ foes, onAccept, onDecline }: {
+  foes: SeatView[];
+  onAccept: (target: Side) => void;
+  onDecline: () => void;
+}) {
+  const eligible = foes.filter((foe) => !foe.eliminated && foe.ships.filter((ship) => !ship.sunk).length >= 2);
+  return (
+    <Shell label="Special strike available">
+      <p className="stencil text-brass">Classified order</p>
+      <h2 className="mt-3 font-display text-[22px] font-semibold tracking-[0.15em] text-flare">SCORCHED EARTH</h2>
+      <p className="mt-4 font-mono text-[11px] leading-relaxed tracking-[0.06em] text-parchment/70">
+        Bomb 50% of your teammate&apos;s board at random. In return, immediately destroy two ships on one enemy fleet.
+      </p>
+      <div className="mt-6 flex flex-wrap justify-center gap-2">
+        {eligible.map((foe) => (
+          <Btn key={foe.side} tone="primary" onClick={() => onAccept(foe.side)}>
+            Strike {foe.name ?? 'enemy'}
+          </Btn>
+        ))}
+        <Btn onClick={onDecline}>Decline</Btn>
+      </div>
+      <p className="mt-4 font-mono text-[9px] tracking-[0.08em] text-parchment/40">DECLINING PASSES THE OFFER TO THE NEXT COMMANDER&apos;S TURN</p>
+    </Shell>
   );
 }
 

@@ -19,7 +19,9 @@ export type MatchAdapter = {
   clearError: () => void;
   deploy: (fleet: Placement[]) => Promise<void>;
   fire: (target: Side, idx: number) => Promise<void>;
+  respondSpecialMove?: (accept: boolean, target?: Side) => Promise<void>;
   rematch: () => Promise<void>;
+  sendChat?: (text: string) => Promise<void>;
   /** Lobby-only. Absent when the match has no team/ready step (solo, duel). */
   setTeam?: (team: Team | null) => Promise<void>;
   setReady?: (ready: boolean) => Promise<void>;

@@ -18,9 +18,12 @@ import {
   claimSeat,
   fetchView,
   postDeploy,
+  postChat,
   postFire,
+  postAutoFire,
   postReady,
   postRematch,
+  postSpecialMove,
   postTeam,
   recallName,
   releaseClaim,
@@ -134,6 +137,24 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     (target: Side, idx: number) => guard((t) => postFire(roomId, t, target, idx, 0)),
     [guard, roomId],
   );
+  const respondSpecialMove = useCallback(
+    (accept: boolean, target?: Side) => guard((t) => postSpecialMove(roomId, t, accept, target, 0)),
+    [guard, roomId],
+  );
+  useEffect(() => {
+    if (!view || view.phase !== 'battle' || view.turn !== view.you || view.turnStartedAt === null) return;
+    if (view.specialMoveOffer) {
+      const expiresAt = view.specialMoveExpiresAt ?? Date.now() + 20_000;
+      const timer = window.setTimeout(
+        () => void respondSpecialMove(false),
+        Math.max(0, expiresAt - Date.now() + 100),
+      );
+      return () => window.clearTimeout(timer);
+    }
+    // Add a small grace period for clock skew between the browser and server.
+    const timer = window.setTimeout(() => void guard((t) => postAutoFire(roomId, t, 0)), Math.max(0, view.turnStartedAt + 12_000 - Date.now() + 500));
+    return () => window.clearTimeout(timer);
+  }, [guard, respondSpecialMove, roomId, view]);
   const setTeam = useCallback(
     (team: Team | null) => guard((t) => postTeam(roomId, t, team, 0)),
     [guard, roomId],
@@ -143,6 +164,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     [guard, roomId],
   );
   const rematch = useCallback(() => guard((t) => postRematch(roomId, t, 0)), [guard, roomId]);
+  const sendChat = useCallback((text: string) => guard((t) => postChat(roomId, t, text, 0)), [guard, roomId]);
 
   return {
     mode: 'online',
@@ -155,9 +177,11 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     clearError: () => setError(null),
     deploy,
     fire,
+    respondSpecialMove,
     setTeam,
     setReady,
     rematch,
+    sendChat,
     retry: () => {
       releaseClaim(roomId);
       setFatal(null);

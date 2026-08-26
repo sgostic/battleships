@@ -68,9 +68,13 @@ export function FleetPanel({
           <h2 className="stencil text-brass">{title}</h2>
           <span className="font-mono text-[9px] text-parchment/40">{alive}/{ships.length}</span>
         </header>
-        <div className={`flex gap-1.5 ${align === 'right' ? 'justify-end' : ''}`}>
+        <div
+          className={`flex min-w-0 items-center justify-between overflow-hidden ${
+            align === 'right' ? 'flex-row-reverse' : ''
+          }`}
+        >
           {ships.map((ship) => (
-            <div key={ship.key} className="scale-[0.72]" title={ship.name}>
+            <div key={ship.key} className="shrink scale-[0.52]" title={ship.name}>
               <ShipSilhouette shipKey={ship.key} sunk={ship.sunk} />
             </div>
           ))}

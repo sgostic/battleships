@@ -122,6 +122,7 @@ type Field = {
   live: Particle[];
   cap: number;
   n: number;
+  dirty: boolean;
 };
 
 type Tween = { t: number; d: number; fn: (u: number) => void; done?: () => void };
@@ -141,6 +142,10 @@ export class SeaBattleScene {
   private sunDir!: THREE.Vector3;
   private clock = new THREE.Clock();
   private raf = 0;
+  private idleTimer = 0;
+  private scheduled: 'raf' | 'idle' | null = null;
+  private highRateUntil = 0;
+  private lastFrameAt = 0;
   private t = 0;
   private amp: number;
   private fire: THREE.Color;
@@ -206,6 +211,18 @@ export class SeaBattleScene {
   private gullTimer: ReturnType<typeof setInterval> | null = null;
 
   private disposed = false;
+  private readonly scratchWorld = new THREE.Vector3();
+  private readonly scratchCamera = new THREE.Vector3();
+  private readonly scratchColor = new THREE.Color();
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden) {
+      this.stopLoop();
+    } else {
+      this.clock.getDelta();
+      this.lastFrameAt = performance.now();
+      this.startLoop();
+    }
+  };
 
   constructor(opts: SceneOptions) {
     this.canvas = opts.canvas;
@@ -229,7 +246,8 @@ export class SeaBattleScene {
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.canvas.parentElement ?? this.canvas);
     this.bind();
-    this.loop();
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    this.startLoop();
   }
 
   /* ------------------------------------------------------------- lifecycle ---- */
@@ -246,6 +264,7 @@ export class SeaBattleScene {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.06;
     renderer.shadowMap.enabled = true;
+    renderer.shadowMap.autoUpdate = false;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer = renderer;
 
@@ -278,16 +297,66 @@ export class SeaBattleScene {
     this.scene.add(fill);
   }
 
-  private loop = (): void => {
-    if (this.disposed) return;
-    this.raf = requestAnimationFrame(this.loop);
-    this.frame(Math.min(0.05, this.clock.getDelta()));
+  private startLoop(): void {
+    if (this.disposed || document.hidden || this.scheduled) return;
+    this.lastFrameAt = performance.now();
+    this.scheduleNext();
+  }
+
+  private stopLoop(): void {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    if (this.idleTimer) window.clearTimeout(this.idleTimer);
+    this.raf = 0;
+    this.idleTimer = 0;
+    this.scheduled = null;
+  }
+
+  private wake(highRateMs = 350): void {
+    this.highRateUntil = Math.max(this.highRateUntil, performance.now() + highRateMs);
+    if (this.scheduled === 'idle') {
+      this.stopLoop();
+      this.startLoop();
+    } else if (!this.scheduled) {
+      this.startLoop();
+    }
+  }
+
+  private highRate(now: number): boolean {
+    const c = this.cam;
+    const cameraMoving = Math.abs(c.tth - c.th) > 0.0005 || Math.abs(c.tph - c.ph) > 0.0005 || Math.abs(c.trad - c.rad) > 0.01;
+    return now < this.highRateUntil || cameraMoving || this.drag !== null || this.pinch !== null || this.tweens.length > 0 || this.fieldAdd.live.length > 0 || this.fieldNorm.live.length > 0;
+  }
+
+  private scheduleNext(): void {
+    if (this.disposed || document.hidden || this.scheduled) return;
+    if (this.highRate(performance.now())) {
+      this.scheduled = 'raf';
+      this.raf = requestAnimationFrame(this.loop);
+    } else {
+      this.scheduled = 'idle';
+      this.idleTimer = window.setTimeout(() => {
+        this.scheduled = null;
+        this.idleTimer = 0;
+        this.loop(performance.now());
+      }, 1000 / 30);
+    }
+  }
+
+  private loop = (now: number): void => {
+    if (this.disposed || document.hidden) return;
+    this.scheduled = null;
+    this.raf = 0;
+    const dt = Math.min(0.05, Math.max(0, (now - this.lastFrameAt) / 1000));
+    this.lastFrameAt = now;
+    this.frame(dt);
+    this.scheduleNext();
   };
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    cancelAnimationFrame(this.raf);
+    this.stopLoop();
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
     this.resizeObserver?.disconnect();
     window.removeEventListener('keydown', this.onKeyDown);
     if (this.gullTimer) clearInterval(this.gullTimer);
@@ -1588,8 +1657,8 @@ export class SeaBattleScene {
   }
 
   private buildFields(): void {
-    this.fieldAdd = { pts: this.mkField(1400, true), free: [], live: [], cap: 1400, n: 0 };
-    this.fieldNorm = { pts: this.mkField(1200, false), free: [], live: [], cap: 1200, n: 0 };
+    this.fieldAdd = { pts: this.mkField(1400, true), free: [], live: [], cap: 1400, n: 0, dirty: false };
+    this.fieldNorm = { pts: this.mkField(1200, false), free: [], live: [], cap: 1200, n: 0, dirty: false };
   }
 
   private emit(
@@ -1630,9 +1699,12 @@ export class SeaBattleScene {
       a1: o.a1 ?? 0,
       wind: o.wind ?? 0,
     });
+    P.dirty = true;
+    this.wake(500);
   }
 
   private updField(P: Field, dt: number): void {
+    if (!P.live.length && !P.dirty) return;
     const at = P.pts.geometry.attributes as unknown as Record<string, THREE.BufferAttribute>;
     for (let k = P.live.length - 1; k >= 0; k--) {
       const q = P.live[k];
@@ -1642,6 +1714,7 @@ export class SeaBattleScene {
         at.palpha.array[q.i] = 0;
         P.free.push(q.i);
         P.live.splice(k, 1);
+        P.dirty = true;
         continue;
       }
       q.v.y -= q.grav * dt;
@@ -1655,7 +1728,7 @@ export class SeaBattleScene {
       at.position.array[i3] = q.p.x;
       at.position.array[i3 + 1] = q.p.y;
       at.position.array[i3 + 2] = q.p.z;
-      const c = q.c0.clone().lerp(q.c1, u);
+      const c = this.scratchColor.copy(q.c0).lerp(q.c1, u);
       at.pcolor.array[i3] = c.r;
       at.pcolor.array[i3 + 1] = c.g;
       at.pcolor.array[i3 + 2] = c.b;
@@ -1666,6 +1739,7 @@ export class SeaBattleScene {
     at.pcolor.needsUpdate = true;
     at.psize.needsUpdate = true;
     at.palpha.needsUpdate = true;
+    P.dirty = false;
   }
 
   private buildPools(): void {
@@ -1754,6 +1828,7 @@ export class SeaBattleScene {
 
   private tw(fn: (u: number) => void, dur: number, done?: () => void): void {
     this.tweens.push({ t: 0, d: dur, fn, done });
+    this.wake(dur * 1000 + 100);
   }
 
   /** A tween that also resolves a promise, so shot choreography can be awaited. */
@@ -1768,6 +1843,7 @@ export class SeaBattleScene {
           resolve();
         },
       });
+      this.wake(dur * 1000 + 100);
     });
   }
 
@@ -2084,6 +2160,7 @@ export class SeaBattleScene {
     this.phase = phase;
     this.interactive = interactive;
     if (phase !== 'deploy') this.clearGhostTint();
+    this.wake();
   }
 
   /** Boards the local player may raycast right now (deploy: `['you']`; battle: living foes). */
@@ -2097,6 +2174,7 @@ export class SeaBattleScene {
       this.pickMeshes.push(rig.pick);
       this.meshToSlot.set(rig.pick, s);
     });
+    this.wake();
   }
 
   /** Highlights whichever board currently owns the turn (a soft light column). */
@@ -2259,9 +2337,10 @@ export class SeaBattleScene {
   revealSunkSilently(slot: Slot, placement: Placement): void {
     const visual = this.visuals.get(slot)?.get(placement.key);
     if (!visual || visual.sunk) return;
-    this.placeShip(slot, placement, false);
+    this.placeShip(slot, placement, true);
     visual.sunk = true;
-    visual.mesh.visible = false;
+    visual.mesh.position.y = visual.baseY;
+    visual.mesh.rotation.z = 0.55;
   }
 
   /**
@@ -2316,7 +2395,41 @@ export class SeaBattleScene {
     if (this.disposed) return;
   }
 
-  private sinkShip(slot: Slot, placement: Placement): void {
+  /** A short, watchable representation of the 50-cell special bombardment. */
+  async playSpecialBombardment(opts: { from: Slot; to: Slot; cells: readonly number[]; marks: readonly number[] }): Promise<void> {
+    const fromRig = this.boards.get(opts.from);
+    const toRig = this.boards.get(opts.to);
+    if (!fromRig || !toRig) return;
+    const dir = new THREE.Vector3(toRig.grp.position.x - fromRig.grp.position.x, 0, toRig.grp.position.z - fromRig.grp.position.z);
+    if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
+    dir.normalize();
+    const src = fromRig.grp.position.clone().addScaledVector(dir, 4.4);
+    src.y += 0.6;
+    // Every real impact gets its own missile, but at a brisk cadence so the
+    // fifty-cell barrage is still watchable rather than a long cutscene.
+    for (const idx of opts.cells) {
+      const dst = this.worldCell(opts.to, idx);
+      await this.shellArc(src.clone(), dst, { apex: 3.4, dur: 0.085 });
+      if (this.disposed) return;
+      const hit = opts.marks[idx] === 2;
+      if (hit) this.boom(dst.clone().add(new THREE.Vector3(0, 0.2, 0)));
+      else this.splash(dst.clone());
+      this.addPeg(opts.to, idx, hit);
+      await new Promise<void>((resolve) => setTimeout(resolve, 18));
+    }
+  }
+
+  /** Reveals and sinks the two ships destroyed by the special strike in sequence. */
+  async playSpecialSinks(slot: Slot, ships: readonly Placement[]): Promise<void> {
+    for (const ship of ships) {
+      if (this.slotMeta.get(slot)?.fogged) this.placeShip(slot, ship, true);
+      this.sinkShip(slot, ship, 0.85);
+      await new Promise<void>((resolve) => setTimeout(resolve, 920));
+      if (this.disposed) return;
+    }
+  }
+
+  private sinkShip(slot: Slot, placement: Placement, duration = 2.2): void {
     const visual = this.visuals.get(slot)?.get(placement.key);
     if (!visual || visual.sunk) return;
     visual.sunk = true;
@@ -2328,7 +2441,9 @@ export class SeaBattleScene {
     this.tw(
       (u) => {
         const e = u * u;
-        m.position.y = y0 - e * 2.2;
+        // Let the wreck settle back to the sea surface, where it remains visible
+        // as a persistent marker for the already-cleared cells.
+        m.position.y = y0 + (visual.baseY - y0) * e;
         m.rotation.z = rz * Math.min(1, u * 1.4);
         m.rotation.x = 0.16 * Math.sin(u * 3);
         if (Math.random() < 0.7) {
@@ -2360,9 +2475,11 @@ export class SeaBattleScene {
           });
         }
       },
-      2.2,
+      duration,
       () => {
-        m.visible = false;
+        m.position.y = visual.baseY;
+        m.rotation.z = rz;
+        m.rotation.x = 0;
       },
     );
     const mid = placement.cells[Math.floor(placement.cells.length / 2)];
@@ -2444,6 +2561,7 @@ export class SeaBattleScene {
   }
 
   private onPointerDown = (e: PointerEvent): void => {
+    this.wake();
     try {
       this.renderer.domElement.setPointerCapture(e.pointerId);
     } catch {
@@ -2460,6 +2578,7 @@ export class SeaBattleScene {
   };
 
   private onPointerMove = (e: PointerEvent): void => {
+    this.wake();
     const p = this.pointerOf(e);
     this.pointers.set(e.pointerId, p);
 
@@ -2483,6 +2602,7 @@ export class SeaBattleScene {
   };
 
   private onPointerUp = (e: PointerEvent): void => {
+    this.wake(150);
     this.pointers.delete(e.pointerId);
     if (this.pointers.size < 2) this.pinch = null;
     if (this.drag && this.moved < 5 && this.hover && this.interactive) {
@@ -2498,6 +2618,7 @@ export class SeaBattleScene {
   }
 
   private onWheel = (e: WheelEvent): void => {
+    this.wake();
     e.preventDefault();
     const [lo, hi] = this.radClamp();
     this.cam.trad = Math.max(lo, Math.min(hi, this.cam.trad + e.deltaY * 0.018));
@@ -2688,7 +2809,7 @@ export class SeaBattleScene {
 
       this.visuals.get(slot)?.forEach((v) => {
         if (!v.mesh.visible || v.sunk) return;
-        const wp = v.mesh.getWorldPosition(new THREE.Vector3());
+        const wp = v.mesh.getWorldPosition(this.scratchWorld);
         const h = this.waveH(wp.x, wp.z, t) * 0.34;
         v.mesh.position.y = v.baseY + h + (v.floating ? 0.16 : 0);
         v.mesh.rotation.z = Math.sin(t * 0.75 + v.bobPhase) * 0.028;
@@ -2719,7 +2840,7 @@ export class SeaBattleScene {
       b.grp.rotation.z = Math.sin(t * 0.4 + b.phase) * 0.006;
 
       // Billboard the nameplate toward the camera, compensating for the board's yaw.
-      const worldPos = b.grp.getWorldPosition(new THREE.Vector3());
+      const worldPos = b.grp.getWorldPosition(this.scratchWorld);
       const toCam = Math.atan2(this.camera.position.x - worldPos.x, this.camera.position.z - worldPos.z);
       b.plate.rotation.y = toCam - b.grp.rotation.y;
 
@@ -2751,7 +2872,7 @@ export class SeaBattleScene {
     c.ph += (c.tph - c.ph) * Math.min(1, dt * 6);
     if (c.push > 0) c.push = Math.max(0, c.push - dt * 0.7);
     c.rad += (c.trad * (1 - c.push * 0.1) - c.rad) * Math.min(1, dt * 4);
-    const cp = new THREE.Vector3().setFromSphericalCoords(c.rad, Math.PI / 2 - c.ph, c.th);
+    const cp = this.scratchCamera.setFromSphericalCoords(c.rad, Math.PI / 2 - c.ph, c.th);
     cp.add(this.target);
     if (c.shake > 0.001) {
       c.shake *= Math.pow(0.02, dt);
@@ -2765,6 +2886,7 @@ export class SeaBattleScene {
     this.ocean.material.uniforms.uCam.value.copy(cp);
     this.sky.position.copy(cp);
 
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.render(this.scene, this.camera);
   }
 }

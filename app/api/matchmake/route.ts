@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 import { cleanName, join, type Mode, viewFor } from '@/lib/game/match';
-import { jsonError, readJson } from '@/lib/net/api';
+import { jsonError, readJson, requiredName } from '@/lib/net/api';
 import {
   createRoom,
   dequeueRoom,
@@ -19,9 +19,11 @@ export const dynamic = 'force-dynamic';
  */
 export async function POST(request: NextRequest) {
   const body = await readJson(request);
+  const required = requiredName(body);
+  if (required instanceof Response) return required;
   const mode: Mode = body.mode === 'duo' ? 'duo' : 'duel';
   const token = newPlayerToken();
-  const name = typeof body.name === 'string' ? body.name : '';
+  const name = required;
 
   try {
     const waiting = await takeJoinableRoom(mode);

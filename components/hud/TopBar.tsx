@@ -51,6 +51,7 @@ export type TopBarProps = {
   copied?: boolean;
   onLeave?: () => void;
   turnChips?: TurnChip[];
+  shotSeconds?: number | null;
 };
 
 export function TopBar({
@@ -65,6 +66,7 @@ export function TopBar({
   copied,
   onLeave,
   turnChips = [],
+  shotSeconds = null,
 }: TopBarProps) {
   return (
     <header className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-4 bg-gradient-to-b from-[rgba(6,18,24,.62)] to-transparent px-5 pt-4 pb-6">
@@ -84,12 +86,13 @@ export function TopBar({
         <div className="h-px w-[120px] bg-gradient-to-r from-transparent via-brass/70 to-transparent" />
         <p
           className={[
-            'font-display text-[12px] font-semibold leading-none tracking-[0.28em] py-0.5',
+            'font-display text-[18px] font-bold leading-none tracking-[0.2em] py-0.5',
             urgent ? 'animate-sb-pulse text-[#e8a04a]' : 'text-parchment',
           ].join(' ')}
         >
           {turnLabel}
         </p>
+        {shotSeconds !== null ? <p className="font-mono text-[11px] font-bold tracking-[0.16em] text-flare">AUTO-FIRE IN {shotSeconds}s</p> : null}
         <p className="stencil text-parchment/45">{phaseLabel}</p>
         <TurnStrip chips={turnChips} />
       </div>

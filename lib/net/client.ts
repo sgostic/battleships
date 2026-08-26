@@ -157,6 +157,16 @@ export async function postFire(
   return view;
 }
 
+export function postAutoFire(roomId: string, token: string, since: number): Promise<MatchView> {
+  return request<{ view: MatchView }>(`/api/rooms/${encodeURIComponent(roomId)}/fire?since=${since}`, { method: 'POST', body: JSON.stringify({ auto: true }), token }).then(({ view }) => view);
+}
+
+export function postSpecialMove(roomId: string, token: string, accept: boolean, target: Side | undefined, since: number): Promise<MatchView> {
+  return request<{ view: MatchView }>(`/api/rooms/${encodeURIComponent(roomId)}/special?since=${since}`, {
+    method: 'POST', body: JSON.stringify({ accept, target }), token,
+  }).then(({ view }) => view);
+}
+
 export async function postTeam(
   roomId: string,
   token: string,
@@ -193,6 +203,12 @@ export async function postRematch(
     { method: 'POST', token },
   );
   return view;
+}
+
+export function postChat(roomId: string, token: string, text: string, since: number): Promise<MatchView> {
+  return request<{ view: MatchView }>(`/api/rooms/${encodeURIComponent(roomId)}/chat?since=${since}`, {
+    method: 'POST', body: JSON.stringify({ text }), token,
+  }).then(({ view }) => view);
 }
 
 /** Fire-and-forget on unload so the opponent is not left waiting on a ghost. */

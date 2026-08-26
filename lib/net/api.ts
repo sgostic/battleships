@@ -27,6 +27,14 @@ export async function readJson(request: NextRequest): Promise<Record<string, unk
   }
 }
 
+/** Returns the caller's nickname, or a client error when it was not supplied. */
+export function requiredName(body: Record<string, unknown>): string | Response {
+  if (typeof body.name !== 'string' || !body.name.trim()) {
+    return jsonError('Enter a nickname to join the room', 400);
+  }
+  return body.name;
+}
+
 export async function resolveRoomId(ctx: { params: Promise<{ id: string }> }): Promise<string> {
   const { id } = await ctx.params;
   return normalizeRoomId(id);

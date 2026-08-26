@@ -24,10 +24,11 @@ import {
   FatalOverlay,
   LobbyOverlay,
   OverOverlay,
+  SpecialMoveOverlay,
   StandbyOverlay,
   WaitingOverlay,
 } from '@/components/hud/Overlays';
-import { ShotLog } from '@/components/hud/ShotLog';
+import { Chat } from '@/components/hud/Chat';
 import { type TurnChip, TopBar } from '@/components/hud/TopBar';
 import type { MatchAdapter } from '@/lib/game/adapter';
 import { LOG_LIMIT, type LogEntry, type LogTag } from '@/lib/game/log';
@@ -96,7 +97,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
 
   const [glFatal, setGlFatal] = useState<string | null>(null);
   const [display, setDisplay] = useState<MatchView | null>(null);
-  const [log, setLog] = useState<LogEntry[]>([]);
+  const [, setLog] = useState<LogEntry[]>([]);
   const [draft, setDraft] = useState<Placement[]>([]);
   const [selKey, setSelKey] = useState<ShipKey | null>(SHIP_DEFS[0].key);
   const [orient, setOrient] = useState<Orient>('H');
@@ -105,8 +106,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [turnAlert, setTurnAlert] = useState(false);
+  const [specialDecisionVersion, setSpecialDecisionVersion] = useState<number | null>(null);
+  const previousTurnRef = useRef<Side | null>(null);
+  const previousTurnStartedAtRef = useRef<number | null>(null);
 
   const appliedRef = useRef(-1);
+  const adapterRef = useRef(adapter);
+  useEffect(() => {
+    adapterRef.current = adapter;
+  }, [adapter]);
   const pendingRef = useRef<MatchView | null>(null);
   const drainingRef = useRef(false);
   const initedRef = useRef(false);
@@ -155,17 +164,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
 
   /* ---------------------------------------------------- snapshots and events ---- */
 
-  const applySnapshot = useCallback((view: MatchView) => {
-    appliedRef.current = view.eventSeq;
+  const syncSceneRoster = useCallback((view: MatchView, reset = false) => {
     const scene = sceneRef.current;
-    const self = view.seats.find((s) => s.relation === 'self') ?? null;
-    setDraft(self?.fleet ?? []);
-    setSelKey(self?.fleet ? null : SHIP_DEFS[0].key);
     if (!scene) return;
-
     const assignments = assignSlots(view);
     scene.setRoster(assignments.map(({ slot, seat }) => seatSpec(seat, slot)));
-    scene.reset();
+    if (reset) scene.reset();
     assignments.forEach(({ slot, seat }) => {
       if (seat.fleet) scene.setFleet(slot, seat.fleet);
       scene.syncBoard(slot, seat.board);
@@ -173,6 +177,14 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
       if (seat.eliminated) scene.markEliminated(slot);
     });
   }, []);
+
+  const applySnapshot = useCallback((view: MatchView) => {
+    appliedRef.current = view.eventSeq;
+    const self = view.seats.find((s) => s.relation === 'self') ?? null;
+    setDraft(self?.fleet ?? []);
+    setSelKey(self?.fleet ? null : SHIP_DEFS[0].key);
+    syncSceneRoster(view, true);
+  }, [syncSceneRoster]);
 
   const applyEvent = useCallback(
     async (event: MatchEvent, view: MatchView) => {
@@ -200,6 +212,25 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           break;
         case 'battle':
           pushLog('CMD', 'Battle stations.');
+          break;
+        case 'special-offer':
+          if (event.side === you) pushLog('CMD', 'A classified strike order awaits your decision');
+          break;
+        case 'special-declined':
+          pushLog('CMD', `${nameOf(event.side)} declined the classified strike`);
+          break;
+        case 'special-strike':
+          {
+            const fromSlot = slotForSide(view, event.by);
+            const allySlot = slotForSide(view, event.ally);
+            const targetSlot = slotForSide(view, event.target);
+            const ally = view.seats.find((seat) => seat.side === event.ally);
+            if (fromSlot && allySlot && ally) {
+              await scene?.playSpecialBombardment({ from: fromSlot, to: allySlot, cells: event.bombed, marks: ally.board });
+            }
+            if (targetSlot) await scene?.playSpecialSinks(targetSlot, event.destroyed);
+          }
+          pushLog('SNK', `${nameOf(event.by)} launched a scorched-earth strike on ${nameOf(event.target)}`);
           break;
         case 'shot': {
           const fromSlot = slotForSide(view, event.by);
@@ -276,12 +307,15 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
         }
         setBusy(false);
         setDisplay(view);
+        // The roster can grow after the initial snapshot (notably when the
+        // second teammate joins). Keep the theater in step with the view.
+        syncSceneRoster(view);
       }
     } finally {
       drainingRef.current = false;
       setBusy(false);
     }
-  }, [applyEvent, applySnapshot, pushLog]);
+  }, [applyEvent, applySnapshot, pushLog, syncSceneRoster]);
 
   useEffect(() => {
     if (!adapter.view) return;
@@ -298,6 +332,49 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const deploying = Boolean(display && yourSeat && !yourSeat.deployed && display.phase !== 'over');
   const battling = display?.phase === 'battle';
   const myTurn = battling && display?.turn === display?.you;
+  const specialMoveOffer = Boolean(display?.specialMoveOffer);
+  const specialDecisionSent = specialDecisionVersion === display?.version;
+  useEffect(() => {
+    if (adapter.mode !== 'solo' || specialDecisionSent || !specialMoveOffer || !adapter.respondSpecialMove) return;
+    const delay = Math.max(0, (display?.specialMoveExpiresAt ?? Date.now() + 20_000) - Date.now());
+    const timer = window.setTimeout(() => void adapter.respondSpecialMove?.(false), delay);
+    return () => window.clearTimeout(timer);
+  }, [adapter, display?.specialMoveExpiresAt, specialDecisionSent, specialMoveOffer]);
+  useEffect(() => {
+    if (!myTurn || specialMoveOffer || adapter.mode !== 'solo' || !display) return;
+    const turnStartedAt = display.turnStartedAt;
+    const timer = window.setTimeout(() => {
+      const latest = adapterRef.current.view;
+      if (!latest || latest.phase !== 'battle' || latest.turn !== latest.you || latest.turnStartedAt !== turnStartedAt) return;
+      const targets = latest.seats.filter((seat) => seat.relation === 'foe' && !seat.eliminated);
+      const choices = targets.flatMap((seat) => seat.board.flatMap((mark, idx) => (mark === 0 ? [{ side: seat.side, idx }] : [])));
+      const choice = choices[Math.floor(Math.random() * choices.length)];
+      if (choice) void adapterRef.current.fire(choice.side, choice.idx);
+    }, Math.max(0, (display.turnStartedAt ?? Date.now()) + 12_000 - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [adapter.mode, display, myTurn, specialMoveOffer]);
+  useEffect(() => {
+    const currentTurn = display?.phase === 'battle' ? display.turn : null;
+    const turnStartedAt = display?.phase === 'battle' ? display.turnStartedAt : null;
+    const becameMyTurn = currentTurn === display?.you && (
+      previousTurnRef.current !== currentTurn || previousTurnStartedAtRef.current !== turnStartedAt
+    );
+    previousTurnRef.current = currentTurn;
+    previousTurnStartedAtRef.current = turnStartedAt;
+    if (!becameMyTurn) return;
+    setTurnAlert(true);
+    const timer = window.setTimeout(() => setTurnAlert(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, [display?.phase, display?.turn, display?.turnStartedAt, display?.you]);
+  const [now, setNow] = useState(0);
+  useEffect(() => {
+    if (!myTurn) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [myTurn]);
+  const shotSeconds = myTurn && display?.turnStartedAt !== null
+    ? Math.max(0, Math.ceil((display!.turnStartedAt! + 12_000 - now) / 1000))
+    : null;
 
   const livingFoeSlots = useMemo(() => {
     if (!display) return [];
@@ -313,16 +390,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
     if (!scene || !display) return;
     const phase: ScenePhase =
       display.phase === 'battle' ? 'battle' : display.phase === 'over' ? 'over' : 'deploy';
-    const interactive = !busy && (deploying || Boolean(myTurn));
+    const interactive = !busy && !specialMoveOffer && (deploying || Boolean(myTurn));
     scene.setPhase(phase, interactive);
 
     if (deploying) scene.setPickable(['you']);
-    else if (myTurn) scene.setPickable(livingFoeSlots);
+    else if (myTurn && !specialMoveOffer) scene.setPickable(livingFoeSlots);
     else scene.setPickable([]);
 
     const actingSlot = display.phase === 'battle' && display.turn ? slotForSide(display, display.turn) : null;
     scene.setActingSlot(actingSlot);
-  }, [display, busy, deploying, myTurn, livingFoeSlots]);
+  }, [display, busy, deploying, myTurn, livingFoeSlots, specialMoveOffer]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -531,6 +608,15 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
     <main className="relative h-dvh w-full overflow-hidden bg-abyss select-none">
       <canvas ref={canvasRef} className="absolute inset-0 block size-full touch-none" />
 
+      {turnAlert ? (
+        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
+          <div className="animate-sb-turn-alert border-y border-brass/80 bg-[rgba(7,22,28,.88)] px-10 py-5 text-center shadow-[0_0_60px_rgba(255,122,47,.28)]">
+            <p className="stencil mb-2 text-brass">Battle stations</p>
+            <p className="font-display text-4xl font-bold tracking-[0.18em] text-flare sm:text-6xl">YOUR TURN</p>
+          </div>
+        </div>
+      ) : null}
+
       <div className="pointer-events-none absolute inset-0">
         <TopBar
           turnLabel={turnLabel}
@@ -544,6 +630,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           copied={copied}
           onLeave={onLeave}
           turnChips={turnChips}
+          shotSeconds={shotSeconds}
         />
 
         {display ? (
@@ -589,7 +676,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
             </div>
 
             <div className="absolute bottom-5 left-5 hidden sm:block">
-              <ShotLog entries={log} />
+              <Chat messages={display.chat} you={display.you} onSend={adapter.sendChat} />
             </div>
 
             <div className="hidden sm:block">
@@ -675,6 +762,20 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
             reasonBlocked={lobbyBlockedReason}
             onJoinTeam={joinTeam}
             onSetReady={setLobbyReady}
+          />
+        ) : null}
+
+        {display?.specialMoveOffer && !specialDecisionSent && adapter.respondSpecialMove ? (
+          <SpecialMoveOverlay
+            foes={foeSeats}
+            onAccept={(target) => {
+              setSpecialDecisionVersion(display.version);
+              void adapter.respondSpecialMove?.(true, target);
+            }}
+            onDecline={() => {
+              setSpecialDecisionVersion(display.version);
+              void adapter.respondSpecialMove?.(false);
+            }}
           />
         ) : null}
 
