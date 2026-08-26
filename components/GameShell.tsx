@@ -608,7 +608,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
     <main className="relative h-dvh w-full overflow-hidden bg-abyss select-none">
       <canvas ref={canvasRef} className="absolute inset-0 block size-full touch-none" />
 
-      {turnAlert ? (
+      {turnAlert && !specialMoveOffer ? (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
           <div className="animate-sb-turn-alert border-y border-brass/80 bg-[rgba(7,22,28,.88)] px-10 py-5 text-center shadow-[0_0_60px_rgba(255,122,47,.28)]">
             <p className="stencil mb-2 text-brass">Battle stations</p>

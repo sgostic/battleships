@@ -101,6 +101,7 @@ export type MatchRules = {
 
 /** One early-match, 2v2-only high-risk strike. */
 export type SpecialMoveState = {
+  /** Randomly selected turn start (5–15) at which offers may begin. */
   triggerTurn: number;
   turnCount: number;
   offerSide: Side | null;
@@ -173,7 +174,7 @@ export function createMatch(
       lobbyReady: rules.lobbyReady ?? mode === 'duo',
     },
     specialMove: mode === 'duo'
-      ? { triggerTurn: Math.floor(Math.random() * 3) + 1, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
+      ? { triggerTurn: Math.floor(Math.random() * 11) + 5, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
       : null,
     open,
   };
@@ -560,6 +561,9 @@ export function respondSpecialMove(state: MatchState, side: Side, acceptRaw: unk
   if (teamsAlive.length === 1) {
     state.phase = 'over'; state.turn = null; state.turnStartedAt = null; state.winner = teamsAlive[0];
     emit(state, { type: 'over', winner: teamsAlive[0] });
+  } else {
+    // Taking the strike is the commander's whole turn; declining is not.
+    startTurn(state, advanceTurn(state, side), now);
   }
   touch(state, now);
   return done(undefined);
@@ -610,7 +614,7 @@ export function requestRematch(
     state.winner = null;
     state.turnOrder = [];
     state.specialMove = state.mode === 'duo'
-      ? { triggerTurn: Math.floor(Math.random() * 3) + 1, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
+      ? { triggerTurn: Math.floor(Math.random() * 11) + 5, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
       : null;
     emit(state, { type: 'reset' });
   }
