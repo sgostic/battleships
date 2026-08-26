@@ -1,15 +1,11 @@
 import type { NextRequest } from 'next/server';
-import { fire, sideForToken, viewFor } from '@/lib/game/match';
+import { setTeam, sideForToken, viewFor } from '@/lib/game/match';
 import { jsonError, parseSince, readJson, readToken, resolveRoomId } from '@/lib/net/api';
 import { mutateRoom } from '@/lib/net/rooms';
 
 export const dynamic = 'force-dynamic';
 
-/**
- * POST /api/rooms/:id/fire — the only place a shot is resolved. Turn order,
- * friendly-fire, duplicate cells, and hit detection are all decided here, never
- * on the client.
- */
+/** POST /api/rooms/:id/team — lobby-only: choose (or clear) Red/Blue. Duo only. */
 export async function POST(request: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const roomId = await resolveRoomId(ctx);
   const token = readToken(request);
@@ -19,7 +15,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   const outcome = await mutateRoom(roomId, (state) => {
     const side = sideForToken(state, token);
     if (!side) return { ok: false as const, error: 'You are not seated in this match', code: 403 };
-    const res = fire(state, side, body.target, body.idx, Date.now());
+    const res = setTeam(state, side, body.team, Date.now());
     return res.ok ? { ok: true as const, value: side } : res;
   });
 

@@ -6,9 +6,9 @@
 import {
   type MatchRules,
   type MatchState,
+  type Mode,
   createMatch,
   isJoinable,
-  seatsTaken,
 } from '../game/match';
 import { ROOM_ALPHABET, ROOM_CODE_LENGTH, normalizeRoomId } from './protocol';
 import { getStore } from './store';
@@ -22,7 +22,12 @@ const LOCK_TTL_MS = 5000;
 const LOCK_ATTEMPTS = 25;
 const LOCK_RETRY_MS = 60;
 
-const QUEUE_KEY = 'sb:queue';
+/** Bumped whenever `MatchState`'s shape changes incompatibly. A room from before
+ *  this schema is discarded rather than fed to rules that don't understand it —
+ *  it will simply age out of its 3h TTL. */
+const SCHEMA = 2;
+
+const queueKey = (mode: Mode) => `sb:queue:${mode}`;
 const roomKey = (id: string) => `sb:room:${id}`;
 const lockKey = (id: string) => `sb:lock:${id}`;
 
@@ -44,19 +49,25 @@ export function newPlayerToken(): string {
 }
 
 export async function loadRoom(id: string): Promise<MatchState | null> {
-  return getStore().getJSON<MatchState>(roomKey(id));
+  const state = await getStore().getJSON<MatchState>(roomKey(id));
+  if (state && state.schema !== SCHEMA) return null;
+  return state;
 }
 
 export async function saveRoom(state: MatchState): Promise<void> {
   await getStore().setJSON(roomKey(state.id), state, ROOM_TTL_SECONDS);
 }
 
-export async function createRoom(rules: MatchRules, open: boolean): Promise<MatchState> {
+export async function createRoom(
+  mode: Mode,
+  rules: Partial<MatchRules>,
+  open: boolean,
+): Promise<MatchState> {
   const store = getStore();
   for (let attempt = 0; attempt < 8; attempt++) {
     const id = newRoomCode();
     if (await store.getJSON(roomKey(id))) continue;
-    const state = createMatch(id, Date.now(), rules, open);
+    const state = createMatch(id, Date.now(), mode, rules, open);
     await saveRoom(state);
     return state;
   }
@@ -105,25 +116,25 @@ export async function mutateRoom<T>(
 
 /* ------------------------------------------------------------- quick match ---- */
 
-export async function enqueueRoom(id: string): Promise<void> {
-  await getStore().rpush(QUEUE_KEY, id, QUEUE_TTL_SECONDS);
+export async function enqueueRoom(mode: Mode, id: string): Promise<void> {
+  await getStore().rpush(queueKey(mode), id, QUEUE_TTL_SECONDS);
 }
 
-export async function dequeueRoom(id: string): Promise<void> {
-  await getStore().lrem(QUEUE_KEY, id);
+export async function dequeueRoom(mode: Mode, id: string): Promise<void> {
+  await getStore().lrem(queueKey(mode), id);
 }
 
 /**
- * Pops room codes until one is still waiting for a second player. Stale codes
- * (expired, filled, or abandoned) are simply discarded.
+ * Pops room codes until one is still waiting for at least one more seat. Stale
+ * codes (expired, filled, or abandoned) are simply discarded.
  */
-export async function takeJoinableRoom(maxScans = 12): Promise<MatchState | null> {
+export async function takeJoinableRoom(mode: Mode, maxScans = 12): Promise<MatchState | null> {
   const store = getStore();
   for (let i = 0; i < maxScans; i++) {
-    const id = await store.lpop(QUEUE_KEY);
+    const id = await store.lpop(queueKey(mode));
     if (!id) return null;
     const state = await loadRoom(id);
-    if (state && state.open && isJoinable(state) && seatsTaken(state) === 1) return state;
+    if (state && state.open && isJoinable(state)) return state;
   }
   return null;
 }

@@ -6,7 +6,7 @@ import { dequeueRoom, mutateRoom, newPlayerToken } from '@/lib/net/rooms';
 export const dynamic = 'force-dynamic';
 
 /**
- * POST /api/rooms/:id/join — takes the free seat, or resumes an existing seat
+ * POST /api/rooms/:id/join — takes a free seat, or resumes an existing seat
  * when the caller already holds a token for this room.
  */
 export async function POST(request: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -24,7 +24,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   if (!outcome.ok) return jsonError(outcome.error, outcome.code);
 
   // A filled room should no longer be offered to quick-match callers.
-  if (!outcome.state.open) await dequeueRoom(roomId);
+  if (!outcome.state.open) await dequeueRoom(outcome.state.mode, roomId);
 
   return Response.json(
     { roomId, token, side: outcome.value, view: viewFor(outcome.state, outcome.value) },

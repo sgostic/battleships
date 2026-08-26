@@ -22,6 +22,6 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   });
 
   if (!outcome.ok) return jsonError(outcome.error, outcome.code);
-  await dequeueRoom(roomId);
+  await dequeueRoom(outcome.state.mode, roomId);
   return Response.json({ ok: true }, { headers: { 'cache-control': 'no-store' } });
 }

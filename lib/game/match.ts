@@ -2,6 +2,11 @@
  * The match state machine. Pure and JSON-serializable so the exact same rules run
  * server-side (authoritative, persisted in Redis) and in the browser for solo play.
  *
+ * Two modes share one machine: `duel` is the original 1v1 (seats a, b — each its
+ * own one-player team), `duo` is 2v2 (seats a-d, two players per team). Turn order
+ * interleaves by team once the battle starts; free targeting means a shot can land
+ * on either living enemy board.
+ *
  * Every mutation appends events. Clients replay events to animate; the redacted
  * snapshot from `viewFor` lets a reconnecting client catch up without spoilers.
  */
@@ -16,8 +21,16 @@ import {
   validateFleet,
 } from './rules';
 
-export type Side = 'a' | 'b';
-export const OTHER: Record<Side, Side> = { a: 'b', b: 'a' };
+export type Side = 'a' | 'b' | 'c' | 'd';
+export type Team = 'red' | 'blue';
+export type Mode = 'duel' | 'duo';
+
+export const SEATS: Record<Mode, readonly Side[]> = {
+  duel: ['a', 'b'],
+  duo: ['a', 'b', 'c', 'd'],
+};
+export const TEAMS: readonly Team[] = ['red', 'blue'];
+export const TEAM_SIZE: Record<Mode, number> = { duel: 1, duo: 2 };
 
 export type Phase = 'lobby' | 'deploy' | 'battle' | 'over';
 
@@ -33,14 +46,20 @@ export type ShipState = {
 };
 
 export type PlayerState = {
-  /** Secret. Never leaves the server for the opposing player. */
+  /** Secret. Never leaves the server for the opposing team. */
   token: string;
   name: string;
+  /** duel: fixed at join. duo: chosen in the lobby, null until then. */
+  team: Team | null;
   ships: ShipState[] | null;
-  /** Shots the opponent has fired at this player's board, indexed by cell. */
+  /** Shots fired at this player's board, indexed by cell. */
   incoming: Mark[];
   shotsFired: number;
   hitsLanded: number;
+  /** Lobby ready-up. Distinct from `ships !== null` (deployed). */
+  ready: boolean;
+  /** This player's fleet is fully sunk; skipped in the turn rotation. */
+  eliminated: boolean;
   rematch: boolean;
   lastSeen: number;
 };
@@ -49,32 +68,46 @@ export type SunkReveal = Placement & { name: string };
 
 export type MatchEvent =
   | { seq: number; type: 'joined'; side: Side; name: string }
+  | { seq: number; type: 'team'; side: Side; team: Team | null }
+  | { seq: number; type: 'ready'; side: Side; ready: boolean }
+  | { seq: number; type: 'deploying' }
   | { seq: number; type: 'deployed'; side: Side }
-  | { seq: number; type: 'battle'; turn: Side }
+  | { seq: number; type: 'battle'; turn: Side; order: Side[] }
   | {
       seq: number;
       type: 'shot';
       by: Side;
+      at: Side;
       idx: number;
       hit: boolean;
       sunk: SunkReveal | null;
       next: Side | null;
     }
-  | { seq: number; type: 'over'; winner: Side }
+  | { seq: number; type: 'eliminated'; side: Side }
+  | { seq: number; type: 'over'; winner: Team }
   | { seq: number; type: 'left'; side: Side }
   | { seq: number; type: 'reset' };
 
-export type MatchRules = { extraShotOnHit: boolean };
+export type MatchRules = {
+  extraShotOnHit: boolean;
+  /** duo: nobody deploys until every seat is filled, teamed, and ready. */
+  lobbyReady: boolean;
+};
 
 export type MatchState = {
   id: string;
+  /** Bumped whenever the shape of this blob changes incompatibly. */
+  schema: 2;
+  mode: Mode;
   version: number;
   createdAt: number;
   updatedAt: number;
   phase: Phase;
   turn: Side | null;
-  winner: Side | null;
-  players: { a: PlayerState | null; b: PlayerState | null };
+  /** Frozen the moment the battle starts; elimination skips seats, never reorders. */
+  turnOrder: Side[];
+  winner: Team | null;
+  players: Record<Side, PlayerState | null>;
   events: MatchEvent[];
   eventSeq: number;
   rules: MatchRules;
@@ -83,7 +116,7 @@ export type MatchState = {
 };
 
 /** Events older than this are dropped; a lagging client resyncs from the snapshot. */
-const EVENT_HISTORY = 80;
+const EVENT_HISTORY = 160;
 
 export type Fail = { ok: false; error: string; code: number };
 export type Done<T = undefined> = { ok: true; value: T };
@@ -95,21 +128,28 @@ const done = <T,>(value: T): Done<T> => ({ ok: true, value });
 export function createMatch(
   id: string,
   now: number,
-  rules: MatchRules = { extraShotOnHit: true },
+  mode: Mode,
+  rules: Partial<MatchRules> = {},
   open = false,
 ): MatchState {
   return {
     id,
+    schema: 2,
+    mode,
     version: 0,
     createdAt: now,
     updatedAt: now,
     phase: 'lobby',
     turn: null,
+    turnOrder: [],
     winner: null,
-    players: { a: null, b: null },
+    players: { a: null, b: null, c: null, d: null },
     events: [],
     eventSeq: 0,
-    rules,
+    rules: {
+      extraShotOnHit: rules.extraShotOnHit ?? true,
+      lobbyReady: rules.lobbyReady ?? mode === 'duo',
+    },
     open,
   };
 }
@@ -130,14 +170,17 @@ function touch(state: MatchState, now: number): void {
   state.updatedAt = now;
 }
 
-function newPlayer(token: string, name: string, now: number): PlayerState {
+function newPlayer(token: string, name: string, now: number, team: Team | null): PlayerState {
   return {
     token,
     name,
+    team,
     ships: null,
     incoming: new Array<Mark>(CELLS).fill(0),
     shotsFired: 0,
     hitsLanded: 0,
+    ready: false,
+    eliminated: false,
     rematch: false,
     lastSeen: now,
   };
@@ -151,21 +194,81 @@ export function cleanName(name: unknown, side: Side): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 18);
-  return safe || (side === 'a' ? 'Commander A' : 'Commander B');
+  return safe || `Commander ${side.toUpperCase()}`;
+}
+
+/* --------------------------------------------------------------- helpers ---- */
+
+export function seatsOf(state: MatchState): readonly Side[] {
+  return SEATS[state.mode];
+}
+
+export function teamOf(state: MatchState, side: Side): Team | null {
+  return state.players[side]?.team ?? null;
+}
+
+/** Seated, undestroyed players on a team. */
+export function livingOn(state: MatchState, team: Team): Side[] {
+  return seatsOf(state).filter((s) => {
+    const p = state.players[s];
+    return Boolean(p && p.team === team && !p.eliminated);
+  });
 }
 
 export function sideForToken(state: MatchState, token: string): Side | null {
-  if (state.players.a?.token === token) return 'a';
-  if (state.players.b?.token === token) return 'b';
+  for (const side of seatsOf(state)) {
+    if (state.players[side]?.token === token) return side;
+  }
   return null;
 }
 
 export function seatsTaken(state: MatchState): number {
-  return (state.players.a ? 1 : 0) + (state.players.b ? 1 : 0);
+  return seatsOf(state).filter((s) => state.players[s]).length;
 }
 
 export function isJoinable(state: MatchState): boolean {
-  return seatsTaken(state) < 2 && state.phase === 'lobby';
+  return seatsTaken(state) < seatsOf(state).length && state.phase === 'lobby';
+}
+
+/** Red seat 1, Blue seat 1, Red seat 2, Blue seat 2, … — frozen once the battle starts. */
+function buildTurnOrder(state: MatchState): Side[] {
+  if (state.mode === 'duel') return ['a', 'b'];
+  const redSeats = seatsOf(state).filter((s) => state.players[s]?.team === 'red');
+  const blueSeats = seatsOf(state).filter((s) => state.players[s]?.team === 'blue');
+  const order: Side[] = [];
+  for (let i = 0; i < Math.max(redSeats.length, blueSeats.length); i++) {
+    if (redSeats[i]) order.push(redSeats[i]);
+    if (blueSeats[i]) order.push(blueSeats[i]);
+  }
+  return order;
+}
+
+/** Next living seat after `from` in the frozen turn order, wrapping; null if none remain. */
+function advanceTurn(state: MatchState, from: Side): Side | null {
+  const order = state.turnOrder;
+  const start = order.indexOf(from);
+  for (let step = 1; step <= order.length; step++) {
+    const side = order[(start + step) % order.length];
+    const player = state.players[side];
+    if (player && !player.eliminated) return side;
+  }
+  return null;
+}
+
+function canStart(state: MatchState): boolean {
+  const seats = seatsOf(state);
+  if (seats.some((s) => !state.players[s])) return false;
+  if (!state.rules.lobbyReady) return true;
+  if (!TEAMS.every((t) => livingOn(state, t).length === TEAM_SIZE[state.mode])) return false;
+  return seats.every((s) => state.players[s]!.ready);
+}
+
+function startIfReady(state: MatchState): void {
+  if (state.phase !== 'lobby') return;
+  if (!canStart(state)) return;
+  state.phase = 'deploy';
+  state.open = false;
+  emit(state, { type: 'deploying' });
 }
 
 /** Seats a player. Returns the side they were seated on. */
@@ -177,24 +280,59 @@ export function join(state: MatchState, token: string, name: string, now: number
   }
   if (!isJoinable(state)) return fail('This match is already full', 409);
 
-  const side: Side = state.players.a ? 'b' : 'a';
-  state.players[side] = newPlayer(token, cleanName(name, side), now);
+  const side = seatsOf(state).find((s) => !state.players[s]);
+  if (!side) return fail('This match is already full', 409);
+  const team: Team | null = state.mode === 'duel' ? (side === 'a' ? 'red' : 'blue') : null;
+  state.players[side] = newPlayer(token, cleanName(name, side), now, team);
   emit(state, { type: 'joined', side, name: state.players[side]!.name });
 
-  if (seatsTaken(state) === 2) {
-    state.phase = 'deploy';
-    state.open = false;
-  }
+  startIfReady(state);
   touch(state, now);
   return done(side);
 }
 
-/** Commits a fleet. Starts the battle once both fleets are in. */
+/** Lobby-only: choose (or clear) a team. Duo only — duel assigns teams at join. */
+export function setTeam(state: MatchState, side: Side, teamRaw: unknown, now: number): Result {
+  const player = state.players[side];
+  if (!player) return fail('You are not seated in this match', 403);
+  if (state.mode !== 'duo') return fail('Team choice is not available in this match', 409);
+  if (state.phase !== 'lobby') return fail('Teams are locked in', 409);
+  if (teamRaw !== 'red' && teamRaw !== 'blue' && teamRaw !== null) {
+    return fail('Unknown team', 422);
+  }
+  const team = teamRaw as Team | null;
+  if (team && team !== player.team && livingOn(state, team).length >= TEAM_SIZE[state.mode]) {
+    return fail('That team is full', 409);
+  }
+  player.team = team;
+  player.ready = false;
+  player.lastSeen = now;
+  emit(state, { type: 'team', side, team });
+  touch(state, now);
+  return done(undefined);
+}
+
+/** Lobby-only: ready up. The battle starts once every seat is filled and ready. */
+export function setReady(state: MatchState, side: Side, readyRaw: unknown, now: number): Result {
+  const player = state.players[side];
+  if (!player) return fail('You are not seated in this match', 403);
+  if (state.phase !== 'lobby') return fail('Too late to change readiness', 409);
+  if (typeof readyRaw !== 'boolean') return fail('Malformed ready flag', 422);
+  if (readyRaw && !player.team) return fail('Choose a team first', 409);
+  player.ready = readyRaw;
+  player.lastSeen = now;
+  emit(state, { type: 'ready', side, ready: readyRaw });
+  startIfReady(state);
+  touch(state, now);
+  return done(undefined);
+}
+
+/** Commits a fleet. Starts the battle once every seat has deployed. */
 export function deploy(state: MatchState, side: Side, fleet: unknown, now: number): Result {
   const player = state.players[side];
   if (!player) return fail('You are not seated in this match', 403);
   if (state.phase !== 'deploy') {
-    return fail(state.phase === 'lobby' ? 'Waiting for an opponent' : 'Deployment has closed', 409);
+    return fail(state.phase === 'lobby' ? 'Waiting for the rest of the crew' : 'Deployment has closed', 409);
   }
   if (player.ships) return fail('Your fleet is already deployed', 409);
   player.lastSeen = now;
@@ -205,28 +343,39 @@ export function deploy(state: MatchState, side: Side, fleet: unknown, now: numbe
   player.ships = check.fleet.map((p) => ({ ...p, hits: 0, sunk: false }));
   emit(state, { type: 'deployed', side });
 
-  if (state.players.a?.ships && state.players.b?.ships) {
+  const seats = seatsOf(state);
+  if (seats.every((s) => state.players[s]?.ships)) {
+    state.turnOrder = buildTurnOrder(state);
     state.phase = 'battle';
-    state.turn = 'a';
-    emit(state, { type: 'battle', turn: state.turn });
+    state.turn = state.turnOrder[0] ?? null;
+    emit(state, { type: 'battle', turn: state.turn as Side, order: state.turnOrder });
   }
   touch(state, now);
   return done(undefined);
 }
 
-/** Resolves a shot. The server is the only place hit/miss is decided. */
-export function fire(state: MatchState, side: Side, idx: unknown, now: number): Result {
+/** Resolves a shot against a chosen enemy board. The server is the only place hit/miss is decided. */
+export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: unknown, now: number): Result {
   const shooter = state.players[side];
   if (!shooter) return fail('You are not seated in this match', 403);
   if (state.phase !== 'battle') return fail('No battle in progress', 409);
   if (state.turn !== side) return fail('Not your turn', 409);
+
+  const seats = seatsOf(state);
+  if (typeof targetRaw !== 'string' || !(seats as string[]).includes(targetRaw)) {
+    return fail('Unknown target', 422);
+  }
+  const targetSide = targetRaw as Side;
+  const target = state.players[targetSide];
+  if (!target) return fail('That seat is empty', 409);
+  if (target.team === shooter.team) return fail('That is a friendly board', 409);
+  if (target.eliminated) return fail('That fleet is already destroyed', 409);
+  if (!target.ships) return fail('Opponent has not deployed', 409);
+
+  const idx = idxRaw;
   if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0 || idx >= CELLS) {
     return fail('Target outside the grid', 422);
   }
-
-  const targetSide = OTHER[side];
-  const target = state.players[targetSide];
-  if (!target?.ships) return fail('Opponent has not deployed', 409);
   if (target.incoming[idx] !== 0) return fail('You already fired at that cell', 409);
 
   shooter.lastSeen = now;
@@ -250,25 +399,30 @@ export function fire(state: MatchState, side: Side, idx: unknown, now: number): 
     }
   }
 
-  const wiped = target.ships.every((s) => s.sunk);
+  if (target.ships.every((s) => s.sunk) && !target.eliminated) {
+    target.eliminated = true;
+    emit(state, { type: 'eliminated', side: targetSide });
+  }
+
   let next: Side | null;
-  if (wiped) {
+  const foeTeam = target.team as Team;
+  if (livingOn(state, foeTeam).length === 0) {
     next = null;
     state.phase = 'over';
     state.turn = null;
-    state.winner = side;
+    state.winner = shooter.team;
   } else {
-    next = hit && state.rules.extraShotOnHit ? side : targetSide;
+    next = hit && state.rules.extraShotOnHit ? side : advanceTurn(state, side);
     state.turn = next;
   }
 
-  emit(state, { type: 'shot', by: side, idx, hit, sunk, next });
-  if (wiped) emit(state, { type: 'over', winner: side });
+  emit(state, { type: 'shot', by: side, at: targetSide, idx, hit, sunk, next });
+  if (state.phase === 'over') emit(state, { type: 'over', winner: state.winner as Team });
   touch(state, now);
   return done(undefined);
 }
 
-/** Both sides must ask before the boards are wiped. */
+/** Every present seat must ask before the boards are wiped. */
 export function requestRematch(
   state: MatchState,
   side: Side,
@@ -280,41 +434,55 @@ export function requestRematch(
 
   player.rematch = true;
   player.lastSeen = now;
-  const both = Boolean(state.players.a?.rematch && state.players.b?.rematch);
-  if (both) {
-    (['a', 'b'] as const).forEach((s) => {
+  const seats = seatsOf(state);
+  const all = seats.every((s) => state.players[s]?.rematch);
+  if (all) {
+    seats.forEach((s) => {
       const p = state.players[s];
       if (!p) return;
       p.ships = null;
       p.incoming = new Array<Mark>(CELLS).fill(0);
       p.shotsFired = 0;
       p.hitsLanded = 0;
+      p.eliminated = false;
       p.rematch = false;
     });
     state.phase = 'deploy';
     state.turn = null;
     state.winner = null;
+    state.turnOrder = [];
     emit(state, { type: 'reset' });
   }
   touch(state, now);
-  return done({ started: both });
+  return done({ started: all });
 }
 
-/** Frees a seat. A walkout during battle hands the win to whoever stayed. */
+/** Frees a seat. A walkout during battle costs that player's whole team the match
+ *  once none of their seats remain. */
 export function leave(state: MatchState, side: Side, now: number): Result {
-  if (!state.players[side]) return done(undefined);
-  const opponent = OTHER[side];
+  const player = state.players[side];
+  if (!player) return done(undefined);
+  const team = player.team;
   state.players[side] = null;
   emit(state, { type: 'left', side });
 
-  if (state.phase === 'battle' && state.players[opponent]) {
-    state.phase = 'over';
-    state.turn = null;
-    state.winner = opponent;
-    emit(state, { type: 'over', winner: opponent });
+  if (state.phase === 'battle' && team) {
+    if (state.turn === side) state.turn = advanceTurn(state, side);
+    if (livingOn(state, team).length === 0) {
+      const winner = TEAMS.find((t) => t !== team)!;
+      state.phase = 'over';
+      state.turn = null;
+      state.winner = winner;
+      emit(state, { type: 'over', winner });
+    }
   } else if (state.phase === 'deploy') {
+    // Committed fleets are kept; everyone re-readies once the room refills.
     state.phase = 'lobby';
     state.turn = null;
+    seatsOf(state).forEach((s) => {
+      const p = state.players[s];
+      if (p) p.ready = false;
+    });
   }
   touch(state, now);
   return done(undefined);
@@ -335,40 +503,47 @@ export type FleetSummary = {
   sunk: boolean;
 };
 
-/** What one player is allowed to know. Un-sunk opponent cells are never included. */
+export type Relation = 'self' | 'ally' | 'foe';
+
+/** What one player is allowed to know about one seat (including their own). */
+export type SeatView = {
+  side: Side;
+  team: Team | null;
+  relation: Relation;
+  name: string | null;
+  present: boolean;
+  ready: boolean;
+  /** Fleet committed. */
+  deployed: boolean;
+  eliminated: boolean;
+  /** Marks on this board — safe to publish to everyone: whoever placed them
+   *  already knows, and this board's own team already sees their own pegs. */
+  board: Mark[];
+  /** Hull positions. Only for `self` and `ally` — the one genuinely secret field. */
+  fleet: Placement[] | null;
+  /** Sunk hulls on this board — the only way a foe's cells are ever revealed. */
+  revealed: SunkReveal[];
+  ships: FleetSummary[];
+  shotsFired: number;
+  hitsLanded: number;
+  rematch: boolean;
+  lastSeen: number | null;
+};
+
+/** What one player is allowed to know about the whole match. */
 export type MatchView = {
   roomId: string;
   version: number;
+  mode: Mode;
   phase: Phase;
   eventSeq: number;
   rules: MatchRules;
-  /** Whose shot it is, from the viewer's perspective. */
-  turn: 'you' | 'them' | null;
+  you: Side;
+  yourTeam: Team | null;
+  seats: SeatView[];
+  turn: Side | null;
+  turnOrder: Side[];
   outcome: 'win' | 'loss' | null;
-  you: {
-    side: Side;
-    name: string;
-    ready: boolean;
-    fleet: Placement[] | null;
-    /** Marks on your own board (shots taken at you). */
-    board: Mark[];
-    ships: FleetSummary[];
-    shotsFired: number;
-    hitsLanded: number;
-    rematch: boolean;
-  };
-  them: {
-    name: string | null;
-    present: boolean;
-    ready: boolean;
-    /** Marks on the enemy board (shots you have fired). */
-    board: Mark[];
-    /** Only ships you have already sunk — the sole way enemy cells are revealed. */
-    revealed: SunkReveal[];
-    ships: FleetSummary[];
-    rematch: boolean;
-    lastSeen: number | null;
-  };
   events: MatchEvent[];
 };
 
@@ -385,49 +560,77 @@ function summarize(ships: ShipState[] | null): FleetSummary[] {
   }));
 }
 
-export function viewFor(state: MatchState, side: Side, since = 0): MatchView {
-  const me = state.players[side];
-  const them = state.players[OTHER[side]];
+function seatView(state: MatchState, viewer: Side, side: Side): SeatView {
+  const p = state.players[side];
+  const viewerTeam = state.players[viewer]?.team ?? null;
+  const relation: Relation =
+    side === viewer ? 'self' : p?.team && p.team === viewerTeam ? 'ally' : 'foe';
+
+  return {
+    side,
+    team: p?.team ?? null,
+    relation,
+    name: p?.name ?? null,
+    present: Boolean(p),
+    ready: Boolean(p?.ready),
+    deployed: Boolean(p?.ships),
+    eliminated: Boolean(p?.eliminated),
+    board: p ? p.incoming : new Array<Mark>(CELLS).fill(0),
+    fleet:
+      relation !== 'foe' && p?.ships
+        ? p.ships.map((s) => ({ key: s.key, orient: s.orient, cells: s.cells }))
+        : null,
+    revealed: (p?.ships ?? [])
+      .filter((s) => s.sunk)
+      .map((s) => ({
+        key: s.key,
+        orient: s.orient,
+        cells: s.cells,
+        name: defFor(s.key)?.name ?? s.key,
+      })),
+    ships: summarize(p?.ships ?? null),
+    shotsFired: p?.shotsFired ?? 0,
+    hitsLanded: p?.hitsLanded ?? 0,
+    rematch: Boolean(p?.rematch),
+    lastSeen: p?.lastSeen ?? null,
+  };
+}
+
+export function viewFor(state: MatchState, viewer: Side, since = 0): MatchView {
+  const me = state.players[viewer];
   if (!me) throw new Error('viewFor called for an unseated side');
 
   return {
     roomId: state.id,
     version: state.version,
+    mode: state.mode,
     phase: state.phase,
     eventSeq: state.eventSeq,
     rules: state.rules,
-    turn: state.turn ? (state.turn === side ? 'you' : 'them') : null,
-    outcome: state.winner ? (state.winner === side ? 'win' : 'loss') : null,
-    you: {
-      side,
-      name: me.name,
-      ready: Boolean(me.ships),
-      fleet: me.ships
-        ? me.ships.map((s) => ({ key: s.key, orient: s.orient, cells: s.cells }))
-        : null,
-      board: me.incoming,
-      ships: summarize(me.ships),
-      shotsFired: me.shotsFired,
-      hitsLanded: me.hitsLanded,
-      rematch: me.rematch,
-    },
-    them: {
-      name: them?.name ?? null,
-      present: Boolean(them),
-      ready: Boolean(them?.ships),
-      board: them ? them.incoming : new Array<Mark>(CELLS).fill(0),
-      revealed: (them?.ships ?? [])
-        .filter((s) => s.sunk)
-        .map((s) => ({
-          key: s.key,
-          orient: s.orient,
-          cells: s.cells,
-          name: defFor(s.key)?.name ?? s.key,
-        })),
-      ships: summarize(them?.ships ?? null),
-      rematch: Boolean(them?.rematch),
-      lastSeen: them?.lastSeen ?? null,
-    },
+    you: viewer,
+    yourTeam: me.team,
+    seats: seatsOf(state).map((s) => seatView(state, viewer, s)),
+    turn: state.turn,
+    turnOrder: state.turnOrder,
+    outcome: state.winner ? (state.winner === me.team ? 'win' : 'loss') : null,
     events: state.events.filter((e) => e.seq > since),
   };
+}
+
+/* -------------------------------------------------------------- selectors ---- */
+
+export function selfSeat(view: MatchView): SeatView {
+  return view.seats.find((s) => s.side === view.you)!;
+}
+
+export function allySeat(view: MatchView): SeatView | null {
+  return view.seats.find((s) => s.relation === 'ally') ?? null;
+}
+
+export function foeSeats(view: MatchView): SeatView[] {
+  return view.seats.filter((s) => s.relation === 'foe');
+}
+
+export function isYourTurn(view: MatchView): boolean {
+  return view.turn === view.you;
 }

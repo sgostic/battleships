@@ -13,6 +13,11 @@ export type FleetPanelProps = {
   placed?: ShipKey[];
   align?: 'left' | 'right';
   onSelect?: (key: ShipKey) => void;
+  /** Header rule tint — set for a 2v2 roster so each panel reads by team. */
+  team?: 'red' | 'blue' | null;
+  /** Squeezes the roster into a single row of silhouettes — for the second
+   *  and third panels once there are more than two fleets on screen. */
+  compact?: boolean;
 };
 
 function pip(
@@ -31,6 +36,11 @@ function pip(
   return mine ? '' : '—';
 }
 
+const TEAM_RULE: Record<'red' | 'blue', string> = {
+  red: 'border-scorch/60',
+  blue: 'border-foam/60',
+};
+
 export function FleetPanel({
   title,
   ships,
@@ -40,12 +50,41 @@ export function FleetPanel({
   placed = [],
   align = 'left',
   onSelect,
+  team = null,
+  compact = false,
 }: FleetPanelProps) {
   const alive = ships.filter((s) => !s.sunk).length;
 
+  if (compact) {
+    return (
+      <section
+        className={[
+          'w-[196px] border-t-2 bg-[rgba(7,20,26,.55)] px-3 py-2 backdrop-blur-md',
+          team ? TEAM_RULE[team] : 'border-brass/30',
+        ].join(' ')}
+        aria-label={title}
+      >
+        <header className="mb-1.5 flex items-baseline justify-between">
+          <h2 className="stencil text-brass">{title}</h2>
+          <span className="font-mono text-[9px] text-parchment/40">{alive}/{ships.length}</span>
+        </header>
+        <div className={`flex gap-1.5 ${align === 'right' ? 'justify-end' : ''}`}>
+          {ships.map((ship) => (
+            <div key={ship.key} className="scale-[0.72]" title={ship.name}>
+              <ShipSilhouette shipKey={ship.key} sunk={ship.sunk} />
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section
-      className="w-[196px] border border-brass/30 bg-[rgba(7,20,26,.55)] px-3 pt-3 pb-2 backdrop-blur-md"
+      className={[
+        'w-[196px] border bg-[rgba(7,20,26,.55)] px-3 pt-3 pb-2 backdrop-blur-md',
+        team ? `${TEAM_RULE[team]} border-t-2` : 'border-brass/30',
+      ].join(' ')}
       aria-label={title}
     >
       <header className="mb-2 flex items-baseline justify-between">

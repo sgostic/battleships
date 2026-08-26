@@ -1,6 +1,6 @@
 /** Browser-side wrappers around the room route handlers. */
 
-import type { MatchView, Side } from '../game/match';
+import type { MatchView, Mode, Side, Team } from '../game/match';
 import type { Placement } from '../game/rules';
 import { PLAYER_TOKEN_HEADER } from './protocol';
 
@@ -52,10 +52,13 @@ async function request<T>(
   return payload as T;
 }
 
-export function createRoom(name: string, opts: { open?: boolean } = {}): Promise<Session> {
+export function createRoom(
+  name: string,
+  opts: { open?: boolean; mode?: Mode } = {},
+): Promise<Session> {
   return request<Session>('/api/rooms', {
     method: 'POST',
-    body: JSON.stringify({ name, open: opts.open ?? false }),
+    body: JSON.stringify({ name, open: opts.open ?? false, mode: opts.mode ?? 'duel' }),
   });
 }
 
@@ -100,10 +103,10 @@ export function releaseClaim(roomId: string): void {
   claims.delete(roomId);
 }
 
-export function quickMatch(name: string): Promise<Session> {
+export function quickMatch(name: string, mode: Mode = 'duel'): Promise<Session> {
   return request<Session>('/api/matchmake', {
     method: 'POST',
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, mode }),
   });
 }
 
@@ -143,12 +146,39 @@ export async function postDeploy(
 export async function postFire(
   roomId: string,
   token: string,
+  target: Side,
   idx: number,
   since: number,
 ): Promise<MatchView> {
   const { view } = await request<{ view: MatchView }>(
     `/api/rooms/${encodeURIComponent(roomId)}/fire?since=${since}`,
-    { method: 'POST', body: JSON.stringify({ idx }), token },
+    { method: 'POST', body: JSON.stringify({ target, idx }), token },
+  );
+  return view;
+}
+
+export async function postTeam(
+  roomId: string,
+  token: string,
+  team: Team | null,
+  since: number,
+): Promise<MatchView> {
+  const { view } = await request<{ view: MatchView }>(
+    `/api/rooms/${encodeURIComponent(roomId)}/team?since=${since}`,
+    { method: 'POST', body: JSON.stringify({ team }), token },
+  );
+  return view;
+}
+
+export async function postReady(
+  roomId: string,
+  token: string,
+  ready: boolean,
+  since: number,
+): Promise<MatchView> {
+  const { view } = await request<{ view: MatchView }>(
+    `/api/rooms/${encodeURIComponent(roomId)}/ready?since=${since}`,
+    { method: 'POST', body: JSON.stringify({ ready }), token },
   );
   return view;
 }

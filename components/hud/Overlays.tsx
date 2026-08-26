@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import type { Team } from '@/lib/game/match';
 import { Btn } from './Btn';
 
 function Shell({ label, children }: { label: string; children: React.ReactNode }) {
@@ -75,15 +76,137 @@ export function StandbyOverlay({ message }: { message: string }) {
   );
 }
 
+/* ------------------------------------------------------------------- lobby ---- */
+
+export type LobbySeat = { name: string; ready: boolean; isYou: boolean };
+
+export type LobbyOverlayProps = {
+  roomCode: string;
+  inviteUrl: string;
+  onCopy: () => void;
+  copied: boolean;
+  yourTeam: Team | null;
+  yourReady: boolean;
+  seatsByTeam: Record<Team, LobbySeat[]>;
+  canReady: boolean;
+  reasonBlocked: string | null;
+  onJoinTeam: (team: Team) => void;
+  onSetReady: (ready: boolean) => void;
+};
+
+const TEAM_LABEL: Record<Team, string> = { red: 'Team Red', blue: 'Team Blue' };
+const TEAM_TEXT: Record<Team, string> = { red: 'text-scorch', blue: 'text-foam' };
+const TEAM_BORDER: Record<Team, string> = { red: 'border-scorch/50', blue: 'border-foam/50' };
+
+function TeamColumn({
+  team,
+  seats,
+  yourTeam,
+  onJoin,
+}: {
+  team: Team;
+  seats: LobbySeat[];
+  yourTeam: Team | null;
+  onJoin: (team: Team) => void;
+}) {
+  const open = 2 - seats.length;
+  return (
+    <div className={`flex-1 border px-4 py-3 ${TEAM_BORDER[team]}`}>
+      <h3 className={`stencil ${TEAM_TEXT[team]}`}>{TEAM_LABEL[team]}</h3>
+      <ul className="mt-2 flex flex-col gap-1.5">
+        {seats.map((s) => (
+          <li
+            key={s.name}
+            className={`font-mono text-[11px] tracking-[0.06em] ${s.isYou ? 'text-flare' : 'text-parchment/75'}`}
+          >
+            {s.name}
+            {s.ready ? <span className="ml-1.5 text-brass/70">READY</span> : null}
+          </li>
+        ))}
+        {Array.from({ length: Math.max(0, open) }).map((_, i) => (
+          <li key={i}>
+            <button
+              type="button"
+              onClick={() => onJoin(team)}
+              disabled={yourTeam === team}
+              className="cursor-pointer font-mono text-[11px] tracking-[0.06em] text-parchment/35 hover:text-parchment/70 disabled:cursor-not-allowed"
+            >
+              OPEN SEAT — join
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** 2v2 lobby: pick a team, ready up. Renders over the 3D theater, which stays alive behind it. */
+export function LobbyOverlay({
+  roomCode,
+  inviteUrl,
+  onCopy,
+  copied,
+  yourTeam,
+  yourReady,
+  seatsByTeam,
+  canReady,
+  reasonBlocked,
+  onJoinTeam,
+  onSetReady,
+}: LobbyOverlayProps) {
+  const readyCount = seatsByTeam.red.filter((s) => s.ready).length + seatsByTeam.blue.filter((s) => s.ready).length;
+  const totalSeats = seatsByTeam.red.length + seatsByTeam.blue.length;
+
+  return (
+    <Shell label="Match lobby">
+      <h2 className="stencil text-brass">2v2 lobby</h2>
+      <p className="mt-3 font-mono text-[26px] leading-none tracking-[0.3em] text-flare">{roomCode}</p>
+      <div className="mx-auto my-4 h-px w-[70px] bg-brass/60" />
+
+      <div className="flex gap-3 text-left">
+        <TeamColumn team="red" seats={seatsByTeam.red} yourTeam={yourTeam} onJoin={onJoinTeam} />
+        <TeamColumn team="blue" seats={seatsByTeam.blue} yourTeam={yourTeam} onJoin={onJoinTeam} />
+      </div>
+
+      <p className="mt-4 font-mono text-[10px] tracking-[0.1em] text-parchment/50">
+        {readyCount}/{Math.max(totalSeats, 4)} READY
+      </p>
+      {reasonBlocked ? (
+        <p className="mt-2 font-mono text-[10px] tracking-[0.06em] text-[#e8a04a]">{reasonBlocked}</p>
+      ) : null}
+
+      <div className="mt-5 flex justify-center gap-2">
+        <Btn
+          tone="primary"
+          onClick={() => onSetReady(!yourReady)}
+          disabled={!yourTeam || (!yourReady && !canReady)}
+          className={yourReady ? 'border-flare text-flare' : ''}
+        >
+          {yourReady ? 'Not ready' : 'Ready'}
+        </Btn>
+        <Btn onClick={onCopy}>{copied ? 'Copied' : 'Copy invite'}</Btn>
+        <Link href="/">
+          <Btn>Cancel</Btn>
+        </Link>
+      </div>
+      <p className="mt-3 truncate font-mono text-[10px] tracking-[0.04em] text-parchment/35">{inviteUrl}</p>
+    </Shell>
+  );
+}
+
+/* --------------------------------------------------------------- game over ---- */
+
 export type OverOverlayProps = {
   outcome: 'win' | 'loss';
   shots: number;
   hits: number;
   onRematch: () => void;
   rematchPending: boolean;
-  opponentWantsRematch: boolean;
-  opponentPresent: boolean;
+  /** Every other seat still relevant to a rematch (excludes yourself). */
+  others: { name: string; present: boolean; rematch: boolean }[];
   soloMode: boolean;
+  /** 2v2 only: your teammate's own tally. */
+  ally: { name: string; shots: number; hits: number } | null;
 };
 
 export function OverOverlay({
@@ -92,12 +215,14 @@ export function OverOverlay({
   hits,
   onRematch,
   rematchPending,
-  opponentWantsRematch,
-  opponentPresent,
+  others,
   soloMode,
+  ally,
 }: OverOverlayProps) {
   const accuracy = shots ? Math.round((hits / shots) * 100) : 0;
   const won = outcome === 'win';
+  const anyoneWantsRematch = others.some((o) => o.rematch);
+  const allGone = others.length > 0 && others.every((o) => !o.present);
 
   return (
     <Shell label={won ? 'Victory' : 'Defeat'}>
@@ -124,18 +249,23 @@ export function OverOverlay({
           <dd>{accuracy}%</dd>
         </div>
       </dl>
+      {ally ? (
+        <p className="mt-2 font-mono text-[10px] tracking-[0.08em] text-parchment/45">
+          {ally.name}: {ally.hits}/{ally.shots} shots
+        </p>
+      ) : null}
 
-      {!soloMode && opponentWantsRematch && !rematchPending ? (
-        <p className="stencil mt-5 text-flare">Opponent wants a rematch</p>
+      {!soloMode && anyoneWantsRematch && !rematchPending ? (
+        <p className="stencil mt-5 text-flare">A teammate wants a rematch</p>
       ) : null}
       {!soloMode && rematchPending ? (
         <p className="stencil mt-5 animate-sb-pulse text-parchment/60">
-          {opponentPresent ? 'Waiting for opponent' : 'Opponent left the theater'}
+          {allGone ? 'Everyone left the theater' : 'Waiting for the rest of the crew'}
         </p>
       ) : null}
 
       <div className="mt-6 flex justify-center gap-2">
-        <Btn tone="primary" onClick={onRematch} disabled={rematchPending || (!soloMode && !opponentPresent)}>
+        <Btn tone="primary" onClick={onRematch} disabled={rematchPending || (!soloMode && allGone)}>
           Rematch
         </Btn>
         <Link href="/">

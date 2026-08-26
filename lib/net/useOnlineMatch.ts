@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MatchAdapter } from '../game/adapter';
-import type { MatchView } from '../game/match';
+import type { MatchView, Side, Team } from '../game/match';
 import type { Placement } from '../game/rules';
 import {
   ApiError,
@@ -19,7 +19,9 @@ import {
   fetchView,
   postDeploy,
   postFire,
+  postReady,
   postRematch,
+  postTeam,
   recallName,
   releaseClaim,
 } from './client';
@@ -70,7 +72,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     };
   }, [roomId, attempt, ingest]);
 
-  /* ---- long-poll for the opponent's moves ---------------------------------- */
+  /* ---- long-poll for the opponents' moves ---------------------------------- */
 
   useEffect(() => {
     if (!token) return;
@@ -129,7 +131,15 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     [guard, roomId],
   );
   const fire = useCallback(
-    (idx: number) => guard((t) => postFire(roomId, t, idx, 0)),
+    (target: Side, idx: number) => guard((t) => postFire(roomId, t, target, idx, 0)),
+    [guard, roomId],
+  );
+  const setTeam = useCallback(
+    (team: Team | null) => guard((t) => postTeam(roomId, t, team, 0)),
+    [guard, roomId],
+  );
+  const setReady = useCallback(
+    (ready: boolean) => guard((t) => postReady(roomId, t, ready, 0)),
     [guard, roomId],
   );
   const rematch = useCallback(() => guard((t) => postRematch(roomId, t, 0)), [guard, roomId]);
@@ -145,6 +155,8 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     clearError: () => setError(null),
     deploy,
     fire,
+    setTeam,
+    setReady,
     rematch,
     retry: () => {
       releaseClaim(roomId);

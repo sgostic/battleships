@@ -3,17 +3,33 @@
  *
  * Ported from the original design's single-file scene. Deliberately free of React
  * and of any game rules — it renders what it is told and reports pointer intent,
- * so the same scene serves both the online match and the solo drill. Three.js is
- * a bundled dependency here rather than a CDN import.
+ * so the same scene serves the online match (1v1 and 2v2) and the solo drill.
+ * Three.js is a bundled dependency here rather than a CDN import.
  *
- * Board vocabulary: `mine` is the left board (fleet you can see), `enemy` is the
- * right board (fleet under fog — hulls appear only once sunk).
+ * Board vocabulary: up to four slots, always viewer-relative — `you` (bottom
+ * left), `ally` (bottom right, 2v2 only), `foeA` / `foeB` (top row). `you` and
+ * `ally` show real hulls; `foeA` / `foeB` stay fogged until a hull sinks. A 1v1
+ * or solo match only ever uses `you` and `foeA`, laid out exactly as the
+ * original two-board table.
  */
 
 import * as THREE from 'three';
 import { BOARD, SHIP_DEFS, cellsFor, type Orient, type Placement, type ShipKey } from './rules';
 
-export type BoardSide = 'mine' | 'enemy';
+export type Slot = 'you' | 'ally' | 'foeA' | 'foeB';
+export const ALL_SLOTS: readonly Slot[] = ['you', 'ally', 'foeA', 'foeB'];
+
+export type SlotSpec = {
+  slot: Slot;
+  name: string;
+  team: 'red' | 'blue' | null;
+  relation: 'self' | 'ally' | 'foe';
+  /** Hulls hidden until sunk; the enemy fog blanket stays up. */
+  fogged: boolean;
+  eliminated: boolean;
+};
+
+export type BoardHit = { slot: Slot; idx: number };
 
 export type ScenePhase = 'deploy' | 'battle' | 'over';
 
@@ -28,10 +44,12 @@ export type SceneOptions = {
   canvas: HTMLCanvasElement;
   waveHeight?: number;
   fireColor?: string;
-  onHover?: (idx: number | null) => void;
-  onPick?: (idx: number) => void;
+  onHover?: (hit: BoardHit | null) => void;
+  onPick?: (hit: BoardHit) => void;
   onFatal?: (message: string) => void;
 };
+
+const TEAM_COLOR: Record<'red' | 'blue', number> = { red: 0xe04b28, blue: 0x4f9aa8 };
 
 type ShipVisual = {
   key: ShipKey;
@@ -47,7 +65,7 @@ type ShipVisual = {
 type AnimSpec = { o: THREE.Object3D; k: 'spin' | 'sweep'; s: number; ph?: number };
 
 type BoardRig = {
-  side: BoardSide;
+  slot: Slot;
   grp: THREE.Group;
   pick: THREE.Mesh;
   pegW: THREE.InstancedMesh;
@@ -55,9 +73,31 @@ type BoardRig = {
   ships: THREE.Group;
   col: THREE.Mesh;
   ret: THREE.Mesh;
-  blanket: THREE.Mesh | null;
-  sign: number;
+  blanket: THREE.Mesh;
+  rail: THREE.MeshStandardMaterial;
+  plate: THREE.Mesh;
+  plateMat: THREE.MeshBasicMaterial;
+  basePos: THREE.Vector3;
+  phase: number;
 };
+
+type Pose = { x: number; z: number; yaw: number };
+
+const POSE_2: Partial<Record<Slot, Pose>> = {
+  you: { x: -6.55, z: 0, yaw: -0.3 },
+  foeA: { x: 6.55, z: 0, yaw: 0.3 },
+};
+
+const POSE_4: Partial<Record<Slot, Pose>> = {
+  you: { x: -6.6, z: 7.0, yaw: -0.22 },
+  ally: { x: 6.6, z: 7.0, yaw: 0.22 },
+  foeA: { x: -6.6, z: -7.0, yaw: -0.14 },
+  foeB: { x: 6.6, z: -7.0, yaw: 0.14 },
+};
+
+/** Camera defaults per table size — a wider table needs a higher, further-back eye. */
+const CAM_2 = { ph: 0.36, rad: 30, radMobile: 38 };
+const CAM_4 = { ph: 0.56, rad: 34, radMobile: 44 };
 
 type Particle = {
   i: number;
@@ -92,8 +132,8 @@ const HORIZON_HEX = '#cf9a6a';
 
 export class SeaBattleScene {
   private readonly canvas: HTMLCanvasElement;
-  private readonly onHover?: (idx: number | null) => void;
-  private readonly onPick?: (idx: number) => void;
+  private readonly onHover?: (hit: BoardHit | null) => void;
+  private readonly onPick?: (hit: BoardHit) => void;
 
   private renderer!: THREE.WebGLRenderer;
   private scene!: THREE.Scene;
@@ -110,11 +150,11 @@ export class SeaBattleScene {
   private materials: Record<string, THREE.MeshStandardMaterial> = {};
   private ocean!: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private sky!: THREE.Mesh;
-  private boards!: Record<BoardSide, BoardRig>;
-  private visuals: Record<BoardSide, Map<ShipKey, ShipVisual>> = {
-    mine: new Map(),
-    enemy: new Map(),
-  };
+  private boards = new Map<Slot, BoardRig>();
+  private visuals = new Map<Slot, Map<ShipKey, ShipVisual>>();
+  private slotMeta = new Map<Slot, SlotSpec>();
+  private rosterLength = 2;
+  private actingSlot: Slot | null = null;
 
   private fieldAdd!: Field;
   private fieldNorm!: Field;
@@ -143,7 +183,10 @@ export class SeaBattleScene {
   private sized = false;
 
   private ray = new THREE.Raycaster();
-  private hoverIdx = -1;
+  private hover: BoardHit | null = null;
+  private pickable: Slot[] = [];
+  private pickMeshes: THREE.Mesh[] = [];
+  private meshToSlot = new Map<THREE.Object3D, Slot>();
   private drag: { cx: number; cy: number; th: number; ph: number } | null = null;
   private pointers = new Map<number, { x: number; y: number; cx: number; cy: number }>();
   private pinch: { d: number; rad: number } | null = null;
@@ -177,11 +220,9 @@ export class SeaBattleScene {
     this.buildSky();
     this.buildOcean();
     this.buildFields();
-    this.boards = {
-      mine: this.buildBoard('mine'),
-      enemy: this.buildBoard('enemy'),
-    };
-    this.buildFleetMeshes();
+    this.ensureBoard('you');
+    this.ensureBoard('foeA');
+    this.layoutBoards();
     this.buildAmbient();
     this.buildPools();
     this.resize();
@@ -209,7 +250,7 @@ export class SeaBattleScene {
     this.renderer = renderer;
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(new THREE.Color(HORIZON_HEX), 42, 250);
+    this.scene.fog = new THREE.Fog(new THREE.Color(HORIZON_HEX), 60, 300);
     this.camera = new THREE.PerspectiveCamera(46, 1, 0.1, 1200);
     this.sunDir = new THREE.Vector3().setFromSphericalCoords(
       1,
@@ -218,16 +259,16 @@ export class SeaBattleScene {
     );
 
     const sun = new THREE.DirectionalLight(0xffc078, 3.1);
-    sun.position.copy(this.sunDir).multiplyScalar(70);
+    sun.position.copy(this.sunDir).multiplyScalar(110);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     const sc = sun.shadow.camera;
-    sc.left = -22;
-    sc.right = 22;
-    sc.top = 16;
-    sc.bottom = -16;
-    sc.near = 20;
-    sc.far = 160;
+    sc.left = -28;
+    sc.right = 28;
+    sc.top = 24;
+    sc.bottom = -24;
+    sc.near = 60;
+    sc.far = 150;
     sun.shadow.bias = -0.0008;
     sun.shadow.normalBias = 0.02;
     this.scene.add(sun);
@@ -280,7 +321,7 @@ export class SeaBattleScene {
     this.camera.updateProjectionMatrix();
     if (!this.sized) {
       this.sized = true;
-      this.cam.trad = this.mobile ? 38 : 30;
+      this.applyCamDefaults();
     }
     (this.fieldAdd.pts.material as THREE.ShaderMaterial).uniforms.uScale.value = h;
     (this.fieldNorm.pts.material as THREE.ShaderMaterial).uniforms.uScale.value = h;
@@ -290,8 +331,8 @@ export class SeaBattleScene {
     return this.mobile;
   }
 
-  hoverIndex(): number {
-    return this.hoverIdx;
+  hoverTarget(): BoardHit | null {
+    return this.hover;
   }
 
   setWaveHeight(amp: number): void {
@@ -654,11 +695,112 @@ export class SeaBattleScene {
     return m;
   }
 
-  private buildBoard(side: BoardSide): BoardRig {
+  /** Builds a board rig if it doesn't already exist. Idempotent. */
+  private ensureBoard(slot: Slot): BoardRig {
+    const existing = this.boards.get(slot);
+    if (existing) return existing;
+    const rig = this.buildBoard(slot);
+    this.boards.set(slot, rig);
+    this.visuals.set(slot, new Map());
+    this.buildFleetMeshesFor(slot, rig);
+    return rig;
+  }
+
+  /** Positions every built board per the pose table matching the current roster size. */
+  private layoutBoards(): void {
+    const pose = this.rosterLength >= 4 ? POSE_4 : POSE_2;
+    this.boards.forEach((rig, slot) => {
+      const p = pose[slot];
+      if (!p) {
+        rig.grp.visible = false;
+        return;
+      }
+      rig.grp.visible = true;
+      rig.basePos.set(p.x, 0.52, p.z);
+      rig.grp.position.copy(rig.basePos);
+      rig.grp.rotation.y = p.yaw;
+    });
+  }
+
+  private applyCamDefaults(): void {
+    const c = this.rosterLength >= 4 ? CAM_4 : CAM_2;
+    this.cam.tph = c.ph;
+    this.cam.ph = c.ph;
+    this.cam.trad = this.mobile ? c.radMobile : c.rad;
+  }
+
+  /**
+   * Declares the roster for this match: which slots exist, their team, relation
+   * to the viewer, and fog state. Builds any newly-needed boards, repositions the
+   * whole table for the roster size, and refreshes rails/nameplates/fog.
+   */
+  setRoster(specs: SlotSpec[]): void {
+    const sizeChanged = specs.length !== this.rosterLength || !this.sized;
+    this.rosterLength = specs.length;
+    this.slotMeta.clear();
+    specs.forEach((s) => {
+      this.slotMeta.set(s.slot, s);
+      this.ensureBoard(s.slot);
+    });
+    this.layoutBoards();
+    if (sizeChanged) this.applyCamDefaults();
+    this.slotMeta.forEach((spec, slot) => {
+      const rig = this.boards.get(slot);
+      if (rig) this.applySlotMeta(rig, spec);
+    });
+  }
+
+  private applySlotMeta(rig: BoardRig, spec: SlotSpec): void {
+    const hex = spec.team ? TEAM_COLOR[spec.team] : 0x8c9296;
+    rig.rail.color.set(hex);
+    rig.rail.emissive.set(hex);
+    rig.rail.emissiveIntensity = spec.eliminated ? 0 : spec.relation === 'self' ? 0.75 : 0.4;
+    rig.blanket.visible = spec.fogged && !spec.eliminated;
+    rig.plateMat.map = this.plateTex(spec);
+    rig.plateMat.map.colorSpace = THREE.SRGBColorSpace;
+    rig.plateMat.needsUpdate = true;
+    rig.grp.position.y = spec.eliminated ? rig.basePos.y - 0.22 : rig.basePos.y;
+  }
+
+  private plateTex(spec: SlotSpec): THREE.CanvasTexture {
+    const W = 512;
+    const H = 160;
+    const c = this.cv(W, H);
+    const x = c.getContext('2d')!;
+    const hex = spec.team ? TEAM_COLOR[spec.team] : 0x8c9296;
+    const teamCss = `#${hex.toString(16).padStart(6, '0')}`;
+    x.fillStyle = 'rgba(7,22,28,.62)';
+    x.fillRect(0, 0, W, H);
+    x.strokeStyle = teamCss;
+    x.lineWidth = 4;
+    x.strokeRect(2, 2, W - 4, H - 4);
+    x.fillStyle = spec.eliminated ? 'rgba(242,228,201,.4)' : '#f2e4c9';
+    x.font = '400 44px Azeret Mono, monospace';
+    x.textAlign = 'center';
+    x.textBaseline = 'middle';
+    x.fillText(spec.name.toUpperCase(), W / 2, H * 0.4);
+    x.fillStyle = teamCss;
+    x.font = '400 24px Azeret Mono, monospace';
+    const role =
+      spec.relation === 'self' ? 'YOUR FLEET' : spec.relation === 'ally' ? 'ALLY' : 'HOSTILE';
+    x.fillText(spec.eliminated ? `${role} · DESTROYED` : role, W / 2, H * 0.72);
+    if (spec.eliminated) {
+      x.strokeStyle = 'rgba(224,75,40,.85)';
+      x.lineWidth = 5;
+      x.beginPath();
+      x.moveTo(W * 0.08, H * 0.86);
+      x.lineTo(W * 0.92, H * 0.14);
+      x.stroke();
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  private buildBoard(slot: Slot): BoardRig {
     const grp = new THREE.Group();
-    const sign = side === 'mine' ? -1 : 1;
-    grp.position.set(sign * 6.55, 0.52, 0);
-    grp.rotation.y = sign * 0.3;
+    const basePos = new THREE.Vector3(0, 0.52, 0);
+    grp.position.copy(basePos);
     this.scene.add(grp);
 
     const brass = this.mat('brass');
@@ -790,32 +932,75 @@ export class SeaBattleScene {
 
     // The enemy grid keeps a fog blanket for the whole board. Per-ship fog was
     // dropped on purpose: in a 1v1 it would betray where the hulls are.
-    let blanket: THREE.Mesh | null = null;
-    if (side === 'enemy') {
-      blanket = new THREE.Mesh(
-        new THREE.PlaneGeometry(10.4, 10.4),
-        new THREE.MeshBasicMaterial({
-          map: this.tex.cloud,
-          transparent: true,
-          opacity: 0.26,
-          depthWrite: false,
-          color: 0xd6e4e6,
-        }),
-      );
-      blanket.rotation.x = -Math.PI / 2;
-      blanket.position.y = 0.42;
-      grp.add(blanket);
-    }
+    // Hidden for `you` / `ally`, shown for a fogged enemy board. Toggled by
+    // `applySlotMeta`, never rebuilt — simpler than adding/removing the mesh.
+    const blanket = new THREE.Mesh(
+      new THREE.PlaneGeometry(10.4, 10.4),
+      new THREE.MeshBasicMaterial({
+        map: this.tex.cloud,
+        transparent: true,
+        opacity: 0.26,
+        depthWrite: false,
+        color: 0xd6e4e6,
+      }),
+    );
+    blanket.rotation.x = -Math.PI / 2;
+    blanket.position.y = 0.42;
+    blanket.visible = false;
+    grp.add(blanket);
 
-    return { side, grp, pick, pegW, pegR, ships, col, ret, blanket, sign };
+    // Team rail: a thin coloured bar just outboard of the brass frame — the
+    // primary "whose board is this" cue at wide framing.
+    const railMat = new THREE.MeshStandardMaterial({
+      color: 0x8c9296,
+      emissive: 0x8c9296,
+      emissiveIntensity: 0.4,
+      roughness: 0.35,
+      metalness: 0.6,
+    });
+    const railBar = (w: number, d: number, x: number, z: number) =>
+      new THREE.Mesh(new THREE.BoxGeometry(w, 0.05, d), railMat).translateX(x).translateZ(z);
+    [
+      railBar(10.9, 0.16, 0, -5.34),
+      railBar(10.9, 0.16, 0, 5.34),
+      railBar(0.16, 10.9, -5.34, 0),
+      railBar(0.16, 10.9, 5.34, 0),
+    ].forEach((m) => {
+      m.castShadow = false;
+      grp.add(m);
+    });
+
+    const plateMat = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false });
+    const namePlate = new THREE.Mesh(new THREE.PlaneGeometry(4, 1.25), plateMat);
+    namePlate.position.set(0, 1.6, -6.3);
+    namePlate.castShadow = false;
+    namePlate.receiveShadow = false;
+    grp.add(namePlate);
+
+    return {
+      slot,
+      grp,
+      pick,
+      pegW,
+      pegR,
+      ships,
+      col,
+      ret,
+      blanket,
+      rail: railMat,
+      plate: namePlate,
+      plateMat,
+      basePos,
+      phase: Math.random() * 6.28,
+    };
   }
 
   private local(c: number, r: number): THREE.Vector3 {
     return new THREE.Vector3(c - 4.5, 0, r - 4.5);
   }
 
-  private worldCell(side: BoardSide, idx: number): THREE.Vector3 {
-    const b = this.boards[side];
+  private worldCell(slot: Slot, idx: number): THREE.Vector3 {
+    const b = this.boards.get(slot)!;
     return b.grp.localToWorld(this.local(idx % BOARD, Math.floor(idx / BOARD)));
   }
 
@@ -1303,23 +1488,21 @@ export class SeaBattleScene {
     return { group: G, anim, baseY };
   }
 
-  private buildFleetMeshes(): void {
-    (['mine', 'enemy'] as const).forEach((side) => {
-      const rig = this.boards[side];
-      SHIP_DEFS.forEach((def) => {
-        const { group, anim, baseY } = this.shipMesh(def.key);
-        group.visible = false;
-        rig.ships.add(group);
-        this.visuals[side].set(def.key, {
-          key: def.key,
-          mesh: group,
-          anim,
-          bobPhase: Math.random() * 6.28,
-          baseY,
-          placement: null,
-          sunk: false,
-          floating: false,
-        });
+  private buildFleetMeshesFor(slot: Slot, rig: BoardRig): void {
+    const visuals = this.visuals.get(slot)!;
+    SHIP_DEFS.forEach((def) => {
+      const { group, anim, baseY } = this.shipMesh(def.key);
+      group.visible = false;
+      rig.ships.add(group);
+      visuals.set(def.key, {
+        key: def.key,
+        mesh: group,
+        anim,
+        bobPhase: Math.random() * 6.28,
+        baseY,
+        placement: null,
+        sunk: false,
+        floating: false,
       });
     });
   }
@@ -1820,12 +2003,16 @@ export class SeaBattleScene {
     this.cam.shake = Math.min(1.1, this.cam.shake + a);
   }
 
-  private shellArc(from: THREE.Vector3, to: THREE.Vector3): Promise<void> {
+  private shellArc(
+    from: THREE.Vector3,
+    to: THREE.Vector3,
+    opts: { apex: number; dur: number },
+  ): Promise<void> {
     const m = this.take(this.shells);
     const mid = from.clone().add(to).multiplyScalar(0.5);
-    mid.y += 5.5 + from.distanceTo(to) * 0.16;
+    mid.y += opts.apex;
     this.sfx('cannon');
-    setTimeout(() => this.sfx('whistle'), 240);
+    setTimeout(() => this.sfx('whistle'), opts.dur * 0.21 * 1000);
     const gun = from.clone();
     gun.y += 0.25;
     this.glow(gun, 0xffcf8a, 0.3, 2.2, 0.28, 1);
@@ -1872,15 +2059,16 @@ export class SeaBattleScene {
           });
         }
       },
-      1.15,
+      opts.dur,
       () => {
         if (m) m.visible = false;
       },
     );
   }
 
-  private addPeg(side: BoardSide, idx: number, hit: boolean): void {
-    const b = this.boards[side];
+  private addPeg(slot: Slot, idx: number, hit: boolean): void {
+    const b = this.boards.get(slot);
+    if (!b) return;
     const im = hit ? b.pegR : b.pegW;
     if (im.count >= 100) return;
     const p = this.local(idx % BOARD, Math.floor(idx / BOARD));
@@ -1898,10 +2086,28 @@ export class SeaBattleScene {
     if (phase !== 'deploy') this.clearGhostTint();
   }
 
+  /** Boards the local player may raycast right now (deploy: `['you']`; battle: living foes). */
+  setPickable(slots: Slot[]): void {
+    this.pickable = slots;
+    this.pickMeshes = [];
+    this.meshToSlot.clear();
+    slots.forEach((s) => {
+      const rig = this.boards.get(s);
+      if (!rig) return;
+      this.pickMeshes.push(rig.pick);
+      this.meshToSlot.set(rig.pick, s);
+    });
+  }
+
+  /** Highlights whichever board currently owns the turn (a soft light column). */
+  setActingSlot(slot: Slot | null): void {
+    this.actingSlot = slot;
+  }
+
   /** Deployment preview: which ship is in hand and which cells are already used. */
   setGhost(ghost: GhostSpec): void {
     if (this.ghost && (!ghost || ghost.key !== this.ghost.key)) {
-      const prev = this.visuals.mine.get(this.ghost.key);
+      const prev = this.visuals.get('you')?.get(this.ghost.key);
       if (prev && !prev.placement) {
         this.tint(prev.mesh, null);
         prev.mesh.visible = false;
@@ -1914,7 +2120,7 @@ export class SeaBattleScene {
 
   private clearGhostTint(): void {
     if (!this.ghost) return;
-    const v = this.visuals.mine.get(this.ghost.key);
+    const v = this.visuals.get('you')?.get(this.ghost.key);
     if (v && !v.placement) {
       this.tint(v.mesh, null);
       v.mesh.visible = false;
@@ -1928,12 +2134,13 @@ export class SeaBattleScene {
   private updateGhost(): void {
     const spec = this.ghost;
     if (!spec) return;
-    const visual = this.visuals.mine.get(spec.key);
+    const visual = this.visuals.get('you')?.get(spec.key);
     const def = SHIP_DEFS.find((d) => d.key === spec.key);
     if (!visual || !def) return;
     if (visual.placement) return;
 
-    if (this.hoverIdx < 0 || this.phase !== 'deploy') {
+    const onOwnBoard = this.hover?.slot === 'you';
+    if (!onOwnBoard || this.phase !== 'deploy') {
       visual.mesh.visible = false;
       visual.floating = false;
       this.ghostCells = null;
@@ -1941,7 +2148,8 @@ export class SeaBattleScene {
       return;
     }
 
-    const cells = cellsFor(this.hoverIdx, def.len, spec.orient);
+    const hoverIdx = this.hover!.idx;
+    const cells = cellsFor(hoverIdx, def.len, spec.orient);
     const taken = new Set(spec.occupied);
     const ok = Boolean(cells) && cells!.every((c) => !taken.has(c));
     this.ghostCells = cells;
@@ -1949,8 +2157,8 @@ export class SeaBattleScene {
 
     visual.mesh.visible = true;
     visual.floating = true;
-    const c0 = this.hoverIdx % BOARD;
-    const r0 = Math.floor(this.hoverIdx / BOARD);
+    const c0 = hoverIdx % BOARD;
+    const r0 = Math.floor(hoverIdx / BOARD);
     const cx = spec.orient === 'H' ? c0 + (def.len - 1) / 2 : c0;
     const cz = spec.orient === 'H' ? r0 : r0 + (def.len - 1) / 2;
     const p = this.local(Math.min(cx, 9), Math.min(cz, 9));
@@ -1991,14 +2199,14 @@ export class SeaBattleScene {
     });
   }
 
-  /** Positions and reveals your own hulls once the fleet is committed. */
-  setMyFleet(fleet: Placement[]): void {
-    fleet.forEach((p) => this.placeShip('mine', p, true));
+  /** Positions and reveals a board's hulls — used for both `you` and `ally`. */
+  setFleet(slot: Slot, fleet: Placement[]): void {
+    fleet.forEach((p) => this.placeShip(slot, p, true));
   }
 
-  /** Places a single hull. `visible` is false for enemy ships until they sink. */
-  private placeShip(side: BoardSide, placement: Placement, visible: boolean): void {
-    const visual = this.visuals[side].get(placement.key);
+  /** Places a single hull. `visible` is false for a fogged board until it sinks. */
+  private placeShip(slot: Slot, placement: Placement, visible: boolean): void {
+    const visual = this.visuals.get(slot)?.get(placement.key);
     if (!visual) return;
     const def = SHIP_DEFS.find((d) => d.key === placement.key)!;
     const c0 = placement.cells[0] % BOARD;
@@ -2017,8 +2225,8 @@ export class SeaBattleScene {
   }
 
   /** Pulls a single hull back off the board (re-placing during deployment). */
-  clearShip(side: BoardSide, key: ShipKey): void {
-    const visual = this.visuals[side].get(key);
+  clearShip(slot: Slot, key: ShipKey): void {
+    const visual = this.visuals.get(slot)?.get(key);
     if (!visual) return;
     this.tint(visual.mesh, null);
     visual.mesh.visible = false;
@@ -2028,50 +2236,66 @@ export class SeaBattleScene {
     visual.floating = false;
   }
 
-  /** Empties one side of the theater without touching pegs or effects. */
-  clearFleet(side: BoardSide): void {
-    this.visuals[side].forEach((v) => this.clearShip(side, v.key));
+  /** Empties one board's fleet without touching pegs or effects. */
+  clearFleet(slot: Slot): void {
+    this.visuals.get(slot)?.forEach((v) => this.clearShip(slot, v.key));
   }
 
   /** Silent board restore — used on first load and on reconnect. */
-  syncBoard(side: BoardSide, marks: readonly number[]): void {
-    const b = this.boards[side];
+  syncBoard(slot: Slot, marks: readonly number[]): void {
+    const b = this.boards.get(slot);
+    if (!b) return;
     b.pegW.count = 0;
     b.pegR.count = 0;
     marks.forEach((m, idx) => {
-      if (m === 1) this.addPeg(side, idx, false);
-      else if (m === 2) this.addPeg(side, idx, true);
+      if (m === 1) this.addPeg(slot, idx, false);
+      else if (m === 2) this.addPeg(slot, idx, true);
     });
     b.pegW.instanceMatrix.needsUpdate = true;
     b.pegR.instanceMatrix.needsUpdate = true;
   }
 
-  /** Shows an already-sunk enemy hull without replaying the animation. */
-  revealSunkSilently(side: BoardSide, placement: Placement): void {
-    const visual = this.visuals[side].get(placement.key);
+  /** Shows an already-sunk hull without replaying the animation. */
+  revealSunkSilently(slot: Slot, placement: Placement): void {
+    const visual = this.visuals.get(slot)?.get(placement.key);
     if (!visual || visual.sunk) return;
-    this.placeShip(side, placement, false);
+    this.placeShip(slot, placement, false);
     visual.sunk = true;
     visual.mesh.visible = false;
   }
 
   /**
    * Full shot choreography: muzzle flash, arc, impact, peg, and the sinking hull.
-   * `target` is the board being fired at.
+   * The shell always leaves from the rim of `from` facing `to`.
    */
   async playShot(opts: {
-    target: BoardSide;
+    from: Slot;
+    to: Slot;
     idx: number;
     hit: boolean;
     sunk: Placement | null;
   }): Promise<void> {
-    const { target, idx, hit, sunk } = opts;
-    const fromBoard: BoardSide = target === 'enemy' ? 'mine' : 'enemy';
-    const src = this.worldCell(fromBoard, target === 'enemy' ? 44 : 45);
-    src.y += 0.6;
-    const dst = this.worldCell(target, idx);
+    const { from, to, idx, hit, sunk } = opts;
+    const fromRig = this.boards.get(from);
+    const toRig = this.boards.get(to);
+    if (!fromRig || !toRig) return;
 
-    await this.shellArc(src, dst);
+    const dir = new THREE.Vector3(
+      toRig.grp.position.x - fromRig.grp.position.x,
+      0,
+      toRig.grp.position.z - fromRig.grp.position.z,
+    );
+    if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
+    dir.normalize();
+    const src = fromRig.grp.position.clone().addScaledVector(dir, 4.4);
+    src.y += 0.6;
+    const dst = this.worldCell(to, idx);
+    const dist = src.distanceTo(dst);
+
+    await this.shellArc(src, dst, {
+      apex: 4.2 + dist * 0.3,
+      dur: Math.min(1.7, Math.max(1.0, 0.85 + dist * 0.028)),
+    });
     if (this.disposed) return;
 
     if (hit) {
@@ -2081,18 +2305,19 @@ export class SeaBattleScene {
     } else {
       this.splash(dst.clone());
     }
-    this.addPeg(target, idx, hit);
+    this.addPeg(to, idx, hit);
 
     if (sunk) {
-      // The enemy hull's position is only known now that the server revealed it.
-      if (target === 'enemy') this.placeShip('enemy', sunk, true);
-      this.sinkShip(target, sunk);
+      // A fogged hull's position is only known now that the server revealed it.
+      if (this.slotMeta.get(to)?.fogged) this.placeShip(to, sunk, true);
+      this.sinkShip(to, sunk);
     }
-    await new Promise<void>((r) => setTimeout(r, hit ? 620 : 420));
+    await new Promise<void>((r) => setTimeout(r, hit ? 460 : 300));
+    if (this.disposed) return;
   }
 
-  private sinkShip(side: BoardSide, placement: Placement): void {
-    const visual = this.visuals[side].get(placement.key);
+  private sinkShip(slot: Slot, placement: Placement): void {
+    const visual = this.visuals.get(slot)?.get(placement.key);
     if (!visual || visual.sunk) return;
     visual.sunk = true;
     const m = visual.mesh;
@@ -2141,21 +2366,29 @@ export class SeaBattleScene {
       },
     );
     const mid = placement.cells[Math.floor(placement.cells.length / 2)];
-    const c = this.worldCell(side, mid);
+    const c = this.worldCell(slot, mid);
     this.slick(c);
     this.smoke(c, 3.2, 20);
     this.cam.push = 1;
   }
 
-  /** Wipes both boards for a rematch. */
+  /** Marks a board destroyed: light and fog drop, the table dips, the plate redraws. */
+  markEliminated(slot: Slot): void {
+    const spec = this.slotMeta.get(slot);
+    if (!spec || spec.eliminated) return;
+    this.slotMeta.set(slot, { ...spec, eliminated: true });
+    const rig = this.boards.get(slot);
+    if (rig) this.applySlotMeta(rig, this.slotMeta.get(slot)!);
+  }
+
+  /** Wipes every board for a rematch. */
   reset(): void {
-    (['mine', 'enemy'] as const).forEach((side) => {
-      const b = this.boards[side];
+    this.boards.forEach((b, slot) => {
       b.pegW.count = 0;
       b.pegR.count = 0;
       b.pegW.instanceMatrix.needsUpdate = true;
       b.pegR.instanceMatrix.needsUpdate = true;
-      this.visuals[side].forEach((v) => {
+      this.visuals.get(slot)?.forEach((v) => {
         this.tint(v.mesh, null);
         v.mesh.visible = false;
         v.mesh.rotation.set(0, 0, 0);
@@ -2164,6 +2397,12 @@ export class SeaBattleScene {
         v.sunk = false;
         v.floating = false;
       });
+      const spec = this.slotMeta.get(slot);
+      if (spec && spec.eliminated) {
+        const revived = { ...spec, eliminated: false };
+        this.slotMeta.set(slot, revived);
+        this.applySlotMeta(b, revived);
+      }
     });
     this.slicks.slice().forEach((s) => {
       this.scene.remove(s);
@@ -2174,7 +2413,7 @@ export class SeaBattleScene {
     this.ghost = null;
     this.ghostCells = null;
     this.ghostValid = false;
-    this.hoverIdx = -1;
+    this.hover = null;
   }
 
   /* ------------------------------------------------------------ interaction ---- */
@@ -2227,7 +2466,8 @@ export class SeaBattleScene {
     if (this.pinch && this.pointers.size === 2) {
       const [a, b] = [...this.pointers.values()];
       const d = Math.hypot(a.cx - b.cx, a.cy - b.cy);
-      this.cam.trad = Math.max(16, Math.min(62, this.pinch.rad * (this.pinch.d / Math.max(1, d))));
+      const [lo, hi] = this.radClamp();
+      this.cam.trad = Math.max(lo, Math.min(hi, this.pinch.rad * (this.pinch.d / Math.max(1, d))));
       return;
     }
     if (this.drag) {
@@ -2245,45 +2485,48 @@ export class SeaBattleScene {
   private onPointerUp = (e: PointerEvent): void => {
     this.pointers.delete(e.pointerId);
     if (this.pointers.size < 2) this.pinch = null;
-    if (this.drag && this.moved < 5 && this.hoverIdx >= 0 && this.interactive) {
-      this.onPick?.(this.hoverIdx);
+    if (this.drag && this.moved < 5 && this.hover && this.interactive) {
+      this.onPick?.(this.hover);
     }
     this.drag = null;
   };
 
+  private radClamp(): [number, number] {
+    const base = this.rosterLength >= 4 ? CAM_4 : CAM_2;
+    const solved = this.mobile ? base.radMobile : base.rad;
+    return [solved * 0.55, solved * 2.0];
+  }
+
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
-    this.cam.trad = Math.max(16, Math.min(62, this.cam.trad + e.deltaY * 0.018));
+    const [lo, hi] = this.radClamp();
+    this.cam.trad = Math.max(lo, Math.min(hi, this.cam.trad + e.deltaY * 0.018));
   };
 
   /** Only camera keys live here; game keys are owned by the React layer. */
   private onKeyDown = (): void => {};
 
   private updateHover(nx: number, ny: number): void {
-    const target = this.activeBoard();
-    let idx = -1;
-    if (target) {
+    let hit: BoardHit | null = null;
+    if (this.interactive && this.pickMeshes.length) {
       this.ray.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
-      const hit = this.ray.intersectObject(target.pick, false)[0];
-      if (hit) {
-        const l = target.grp.worldToLocal(hit.point.clone());
-        const c = Math.floor(l.x + 5);
-        const r = Math.floor(l.z + 5);
-        if (c >= 0 && c < BOARD && r >= 0 && r < BOARD) idx = r * BOARD + c;
+      const found = this.ray.intersectObjects(this.pickMeshes, false)[0];
+      if (found) {
+        const slot = this.meshToSlot.get(found.object);
+        const rig = slot ? this.boards.get(slot) : undefined;
+        if (slot && rig) {
+          const l = rig.grp.worldToLocal(found.point.clone());
+          const c = Math.floor(l.x + 5);
+          const r = Math.floor(l.z + 5);
+          if (c >= 0 && c < BOARD && r >= 0 && r < BOARD) hit = { slot, idx: r * BOARD + c };
+        }
       }
     }
-    if (idx !== this.hoverIdx) {
-      this.hoverIdx = idx;
-      this.onHover?.(idx < 0 ? null : idx);
+    if (hit?.slot !== this.hover?.slot || hit?.idx !== this.hover?.idx) {
+      this.hover = hit;
+      this.onHover?.(hit);
       if (this.phase === 'deploy') this.updateGhost();
     }
-  }
-
-  private activeBoard(): BoardRig | null {
-    if (!this.interactive) return null;
-    if (this.phase === 'deploy') return this.boards.mine;
-    if (this.phase === 'battle') return this.boards.enemy;
-    return null;
   }
 
   /* ------------------------------------------------------------------ audio ---- */
@@ -2438,9 +2681,12 @@ export class SeaBattleScene {
     this.updField(this.fieldAdd, dt);
     this.updField(this.fieldNorm, dt);
 
-    (['mine', 'enemy'] as const).forEach((side) => {
-      const b = this.boards[side];
-      this.visuals[side].forEach((v) => {
+    this.boards.forEach((b, slot) => {
+      if (!b.grp.visible) return;
+      const meta = this.slotMeta.get(slot);
+      const fogged = meta?.fogged ?? slot.startsWith('foe');
+
+      this.visuals.get(slot)?.forEach((v) => {
         if (!v.mesh.visible || v.sunk) return;
         const wp = v.mesh.getWorldPosition(new THREE.Vector3());
         const h = this.waveH(wp.x, wp.z, t) * 0.34;
@@ -2453,28 +2699,38 @@ export class SeaBattleScene {
         });
       });
 
-      const active =
-        this.interactive &&
-        ((this.phase === 'battle' && side === 'enemy') ||
-          (this.phase === 'deploy' && side === 'mine'));
-      const show = active && this.hoverIdx >= 0;
-      b.col.visible = show && side === 'enemy';
+      const show = this.interactive && this.hover?.slot === slot;
+      b.col.visible = show && fogged;
       b.ret.visible = show;
       if (show) {
-        const p = this.local(this.hoverIdx % BOARD, Math.floor(this.hoverIdx / BOARD));
+        const p = this.local(this.hover!.idx % BOARD, Math.floor(this.hover!.idx / BOARD));
         b.col.position.set(p.x, 1.6, p.z);
         (b.col.material as THREE.MeshBasicMaterial).opacity = 0.28 + 0.16 * Math.sin(t * 3);
         b.ret.position.set(p.x, 0.05, p.z);
         b.ret.rotation.z = t * 0.6;
         b.ret.scale.setScalar(1 + 0.04 * Math.sin(t * 5));
       }
-      if (b.blanket) {
+      if (b.blanket.visible) {
         const mat = b.blanket.material as THREE.MeshBasicMaterial;
         mat.opacity = 0.34 + 0.06 * Math.sin(t * 0.4);
         b.blanket.position.y = 0.4 + 0.04 * Math.sin(t * 0.5);
       }
-      b.grp.position.y = 0.52 + this.waveH(b.grp.position.x, 0, t) * 0.1;
-      b.grp.rotation.z = Math.sin(t * 0.4 + (side === 'mine' ? 0 : 2)) * 0.006;
+      b.grp.position.y = b.basePos.y + this.waveH(b.grp.position.x, 0, t) * 0.1;
+      b.grp.rotation.z = Math.sin(t * 0.4 + b.phase) * 0.006;
+
+      // Billboard the nameplate toward the camera, compensating for the board's yaw.
+      const worldPos = b.grp.getWorldPosition(new THREE.Vector3());
+      const toCam = Math.atan2(this.camera.position.x - worldPos.x, this.camera.position.z - worldPos.z);
+      b.plate.rotation.y = toCam - b.grp.rotation.y;
+
+      // The acting board rises slightly and its rail glows — the primary
+      // "whose turn is it" cue at wide framing.
+      const acting = this.actingSlot === slot && !meta?.eliminated;
+      b.grp.position.y += acting ? 0.08 : 0;
+      const baseIntensity = meta?.eliminated ? 0 : meta?.relation === 'self' ? 0.75 : 0.4;
+      b.rail.emissiveIntensity = acting
+        ? baseIntensity + 0.35 + 0.15 * Math.sin(t * 4)
+        : baseIntensity;
     });
 
     this.clouds.forEach((c) => {

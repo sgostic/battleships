@@ -8,6 +8,7 @@ import { type AiLevel, type AiMemory, aiObserve, aiPick, newAiMemory } from './a
 import {
   type MatchState,
   type MatchView,
+  type Side,
   createMatch,
   deploy as deployFleetTo,
   fire as fireAt,
@@ -19,6 +20,8 @@ import { type Placement, randomFleet } from './rules';
 
 const YOU = 'solo-you';
 const FOE = 'solo-ai';
+const YOU_SIDE: Side = 'a';
+const FOE_SIDE: Side = 'b';
 
 export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
   const stateRef = useRef<MatchState | null>(null);
@@ -28,7 +31,7 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
 
   const publish = useCallback(() => {
     const state = stateRef.current;
-    if (state) setView(viewFor(state, 'a'));
+    if (state) setView(viewFor(state, YOU_SIDE));
   }, []);
 
   /** Runs the AI until the turn comes back to the player. */
@@ -36,13 +39,13 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
     const state = stateRef.current;
     if (!state) return;
     let guard = 0;
-    while (state.phase === 'battle' && state.turn === 'b' && guard++ < 120) {
-      const incoming = state.players.a?.incoming;
+    while (state.phase === 'battle' && state.turn === FOE_SIDE && guard++ < 120) {
+      const incoming = state.players[YOU_SIDE]?.incoming;
       if (!incoming) break;
       const pick = aiPick(memoryRef.current, incoming, level);
       if (pick === null) break;
       const before = state.eventSeq;
-      const res = fireAt(state, 'b', pick, Date.now());
+      const res = fireAt(state, FOE_SIDE, YOU_SIDE, pick, Date.now());
       if (!res.ok) break;
       const shot = state.events.find((e) => e.seq === before + 1);
       if (shot?.type === 'shot') {
@@ -53,10 +56,10 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
 
   const start = useCallback(() => {
     const now = Date.now();
-    const state = createMatch('SOLO', now, { extraShotOnHit: true });
+    const state = createMatch('SOLO', now, 'duel', { extraShotOnHit: true });
     join(state, YOU, 'You', now);
     join(state, FOE, 'Fleet Command', now);
-    deployFleetTo(state, 'b', randomFleet(), now);
+    deployFleetTo(state, FOE_SIDE, randomFleet(), now);
     stateRef.current = state;
     memoryRef.current = newAiMemory();
     publish();
@@ -70,7 +73,7 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
     async (fleet: Placement[]) => {
       const state = stateRef.current;
       if (!state) return;
-      const res = deployFleetTo(state, 'a', fleet, Date.now());
+      const res = deployFleetTo(state, YOU_SIDE, fleet, Date.now());
       if (!res.ok) {
         setError(res.error);
         return;
@@ -81,10 +84,10 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
   );
 
   const fire = useCallback(
-    async (idx: number) => {
+    async (target: Side, idx: number) => {
       const state = stateRef.current;
       if (!state) return;
-      const res = fireAt(state, 'a', idx, Date.now());
+      const res = fireAt(state, YOU_SIDE, target, idx, Date.now());
       if (!res.ok) {
         setError(res.error);
         return;
@@ -99,13 +102,13 @@ export function useSoloMatch(level: AiLevel = 'Officer'): MatchAdapter {
     const state = stateRef.current;
     if (!state) return;
     const now = Date.now();
-    requestRematch(state, 'a', now);
-    const res = requestRematch(state, 'b', now);
+    requestRematch(state, YOU_SIDE, now);
+    const res = requestRematch(state, FOE_SIDE, now);
     if (!res.ok) {
       setError(res.error);
       return;
     }
-    deployFleetTo(state, 'b', randomFleet(), now);
+    deployFleetTo(state, FOE_SIDE, randomFleet(), now);
     memoryRef.current = newAiMemory();
     publish();
   }, [publish]);

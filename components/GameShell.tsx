@@ -7,27 +7,40 @@
  * authoritative snapshots handed over by a `MatchAdapter`. Snapshots are not
  * rendered the moment they arrive: their events are animated first, then the
  * snapshot is committed. That keeps the panels from spoiling a shell that is
- * still in the air, and it is what lets online and solo play share one shell.
+ * still in the air, and it is what lets online (duel or duo) and solo play
+ * share one shell.
+ *
+ * The match machine speaks in seats (`Side`); the 3D theater speaks in
+ * viewer-relative slots (`you` / `ally` / `foeA` / `foeB`). This file is the
+ * only place that translates between the two.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Btn } from '@/components/hud/Btn';
 import { DeployBar, FireBar, TargetReadout } from '@/components/hud/Controls';
 import { FleetPanel } from '@/components/hud/FleetPanel';
 import {
   ErrorToast,
   FatalOverlay,
+  LobbyOverlay,
   OverOverlay,
   StandbyOverlay,
   WaitingOverlay,
 } from '@/components/hud/Overlays';
 import { ShotLog } from '@/components/hud/ShotLog';
-import { TopBar } from '@/components/hud/TopBar';
+import { type TurnChip, TopBar } from '@/components/hud/TopBar';
 import type { MatchAdapter } from '@/lib/game/adapter';
 import { LOG_LIMIT, type LogEntry, type LogTag } from '@/lib/game/log';
-import type { MatchEvent, MatchView } from '@/lib/game/match';
+import type { MatchEvent, MatchView, SeatView, Side, Team } from '@/lib/game/match';
 import { SHIP_DEFS, type Orient, type Placement, type ShipKey, cellName, cellsFor, defFor, randomFleet } from '@/lib/game/rules';
-import { type BoardSide, type SceneOptions, type ScenePhase, SeaBattleScene, createScene } from '@/lib/game/scene';
+import {
+  type BoardHit,
+  type ScenePhase,
+  type Slot,
+  type SlotSpec,
+  SeaBattleScene,
+  createScene,
+} from '@/lib/game/scene';
 
 export type GameShellProps = {
   adapter: MatchAdapter;
@@ -36,6 +49,46 @@ export type GameShellProps = {
   inviteUrl?: string;
   onLeave?: () => void;
 };
+
+/* ------------------------------------------------------------ slot mapping ---- */
+
+type SlotAssignment = { slot: Slot; seat: SeatView };
+
+/** Maps the match's absolute seats onto the theater's viewer-relative slots. */
+function assignSlots(view: MatchView): SlotAssignment[] {
+  const out: SlotAssignment[] = [];
+  view.seats.forEach((seat) => {
+    if (seat.relation === 'self') out.push({ slot: 'you', seat });
+    else if (seat.relation === 'ally') out.push({ slot: 'ally', seat });
+  });
+  let foeIdx = 0;
+  view.seats.forEach((seat) => {
+    if (seat.relation === 'foe') {
+      out.push({ slot: foeIdx === 0 ? 'foeA' : 'foeB', seat });
+      foeIdx += 1;
+    }
+  });
+  return out;
+}
+
+function slotForSide(view: MatchView, side: Side): Slot | null {
+  return assignSlots(view).find((a) => a.seat.side === side)?.slot ?? null;
+}
+
+function sideForSlot(view: MatchView, slot: Slot): Side | null {
+  return assignSlots(view).find((a) => a.slot === slot)?.seat.side ?? null;
+}
+
+function seatSpec(seat: SeatView, slot: Slot): SlotSpec {
+  return {
+    slot,
+    name: seat.name ?? 'Commander',
+    team: seat.team,
+    relation: seat.relation,
+    fogged: seat.relation === 'foe',
+    eliminated: seat.eliminated,
+  };
+}
 
 export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShellProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -47,7 +100,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const [draft, setDraft] = useState<Placement[]>([]);
   const [selKey, setSelKey] = useState<ShipKey | null>(SHIP_DEFS[0].key);
   const [orient, setOrient] = useState<Orient>('H');
-  const [hover, setHover] = useState<number | null>(null);
+  const [hover, setHover] = useState<BoardHit | null>(null);
   const [muted, setMuted] = useState(true);
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -59,7 +112,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const initedRef = useRef(false);
   const logIdRef = useRef(0);
   /** Always points at the current render's pick handler. */
-  const pickRef = useRef<(idx: number) => void>(() => {});
+  const pickRef = useRef<(hit: BoardHit) => void>(() => {});
 
   const pushLog = useCallback((tag: LogTag, text: string) => {
     logIdRef.current += 1;
@@ -73,13 +126,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const opts: SceneOptions = {
+    const scene = createScene({
       canvas,
-      onHover: (idx) => setHover(idx),
-      onPick: (idx) => pickRef.current(idx),
+      onHover: (hit) => setHover(hit),
+      onPick: (hit) => pickRef.current(hit),
       onFatal: (message) => setGlFatal(message),
-    };
-    const scene = createScene(opts);
+    });
     sceneRef.current = scene;
 
     return () => {
@@ -106,64 +158,83 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const applySnapshot = useCallback((view: MatchView) => {
     appliedRef.current = view.eventSeq;
     const scene = sceneRef.current;
-    setDraft(view.you.fleet ?? []);
-    setSelKey(view.you.fleet ? null : SHIP_DEFS[0].key);
+    const self = view.seats.find((s) => s.relation === 'self') ?? null;
+    setDraft(self?.fleet ?? []);
+    setSelKey(self?.fleet ? null : SHIP_DEFS[0].key);
     if (!scene) return;
 
+    const assignments = assignSlots(view);
+    scene.setRoster(assignments.map(({ slot, seat }) => seatSpec(seat, slot)));
     scene.reset();
-    if (view.you.fleet) scene.setMyFleet(view.you.fleet);
-    scene.syncBoard('mine', view.you.board);
-    scene.syncBoard('enemy', view.them.board);
-    view.them.revealed.forEach((p) => scene.revealSunkSilently('enemy', p));
-
-    if (view.you.fleet) {
-      const sunk = new Set(view.you.ships.filter((s) => s.sunk).map((s) => s.key));
-      view.you.fleet
-        .filter((p) => sunk.has(p.key))
-        .forEach((p) => scene.revealSunkSilently('mine', p));
-    }
+    assignments.forEach(({ slot, seat }) => {
+      if (seat.fleet) scene.setFleet(slot, seat.fleet);
+      scene.syncBoard(slot, seat.board);
+      seat.revealed.forEach((p) => scene.revealSunkSilently(slot, p));
+      if (seat.eliminated) scene.markEliminated(slot);
+    });
   }, []);
 
   const applyEvent = useCallback(
     async (event: MatchEvent, view: MatchView) => {
       const scene = sceneRef.current;
-      const you = view.you.side;
+      const you = view.you;
+      const nameOf = (side: Side) => view.seats.find((s) => s.side === side)?.name ?? 'Commander';
 
       switch (event.type) {
         case 'joined':
           if (event.side !== you) pushLog('CMD', `${event.name} entered the theater`);
           break;
+        case 'team':
+          if (event.side !== you) {
+            const label = event.team === 'red' ? 'Team Red' : event.team === 'blue' ? 'Team Blue' : 'no team';
+            pushLog('CMD', `${nameOf(event.side)} joined ${label}`);
+          }
+          break;
+        case 'ready':
+          break;
+        case 'deploying':
+          pushLog('CMD', 'All hands aboard. Deploy your fleet.');
+          break;
         case 'deployed':
-          pushLog('RDY', event.side === you ? 'Your fleet is set' : 'Enemy fleet is set');
+          pushLog('RDY', event.side === you ? 'Your fleet is set' : `${nameOf(event.side)}'s fleet is set`);
           break;
         case 'battle':
           pushLog('CMD', 'Battle stations.');
           break;
         case 'shot': {
-          const mine = event.by === you;
-          const target: BoardSide = mine ? 'enemy' : 'mine';
-          await scene?.playShot({
-            target,
-            idx: event.idx,
-            hit: event.hit,
-            sunk: event.sunk,
-          });
-          const who = mine ? 'You' : 'Enemy';
-          if (event.sunk) pushLog('SNK', `${who} sank the ${event.sunk.name}`);
-          else if (event.hit) pushLog('HIT', `${who} hit at ${cellName(event.idx)}`);
-          else pushLog('MIS', `${who} missed at ${cellName(event.idx)}`);
+          const fromSlot = slotForSide(view, event.by);
+          const toSlot = slotForSide(view, event.at);
+          if (fromSlot && toSlot) {
+            await scene?.playShot({
+              from: fromSlot,
+              to: toSlot,
+              idx: event.idx,
+              hit: event.hit,
+              sunk: event.sunk,
+            });
+          }
+          const who = event.by === you ? 'You' : nameOf(event.by);
+          const target = event.at === you ? 'you' : nameOf(event.at);
+          if (event.sunk) {
+            pushLog('SNK', `${who} sank ${target === 'you' ? 'your' : `${target}'s`} ${event.sunk.name}`);
+          } else if (event.hit) {
+            pushLog('HIT', `${who} hit ${target} at ${cellName(event.idx)}`);
+          } else {
+            pushLog('MIS', `${who} missed ${target} at ${cellName(event.idx)}`);
+          }
+          break;
+        }
+        case 'eliminated': {
+          const slot = slotForSide(view, event.side);
+          if (slot) scene?.markEliminated(slot);
+          pushLog('ELM', event.side === you ? 'Your fleet is destroyed' : `${nameOf(event.side)}'s fleet is destroyed`);
           break;
         }
         case 'over':
-          if (event.winner === you) {
-            // A walkout also ends the match, so do not claim a kill we did not make.
-            pushLog('CMD', view.them.present ? 'Enemy fleet destroyed' : 'Opponent forfeited');
-          } else {
-            pushLog('CMD', 'Your fleet is lost');
-          }
+          pushLog('CMD', view.outcome === 'win' ? 'Victory' : 'Defeat');
           break;
         case 'left':
-          if (event.side !== you) pushLog('ERR', 'Opponent left the theater');
+          if (event.side !== you) pushLog('ERR', 'A commander left the theater');
           break;
         case 'reset':
           scene?.reset();
@@ -189,7 +260,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           applySnapshot(view);
           initedRef.current = true;
           setDisplay(view);
-          if (!view.you.fleet) pushLog('RDY', 'Place your fleet. Drag to orbit.');
+          const self = view.seats.find((s) => s.relation === 'self');
+          if (!self?.fleet) pushLog('RDY', 'Place your fleet. Drag to orbit.');
           continue;
         }
 
@@ -217,11 +289,24 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
     void drain();
   }, [adapter.view, drain]);
 
-  /* ------------------------------------------------------------ scene inputs ---- */
+  /* ------------------------------------------------------------ derived state ---- */
 
-  const deploying = Boolean(display && !display.you.ready && display.phase !== 'over');
+  const yourSeat = display?.seats.find((s) => s.relation === 'self') ?? null;
+  const allySeat = display?.seats.find((s) => s.relation === 'ally') ?? null;
+  const foeSeats = display?.seats.filter((s) => s.relation === 'foe') ?? [];
+
+  const deploying = Boolean(display && yourSeat && !yourSeat.deployed && display.phase !== 'over');
   const battling = display?.phase === 'battle';
-  const myTurn = battling && display?.turn === 'you';
+  const myTurn = battling && display?.turn === display?.you;
+
+  const livingFoeSlots = useMemo(() => {
+    if (!display) return [];
+    return assignSlots(display)
+      .filter((a) => (a.slot === 'foeA' || a.slot === 'foeB') && !a.seat.eliminated)
+      .map((a) => a.slot);
+  }, [display]);
+
+  /* ------------------------------------------------------------ scene inputs ---- */
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -230,7 +315,14 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
       display.phase === 'battle' ? 'battle' : display.phase === 'over' ? 'over' : 'deploy';
     const interactive = !busy && (deploying || Boolean(myTurn));
     scene.setPhase(phase, interactive);
-  }, [display, busy, deploying, myTurn]);
+
+    if (deploying) scene.setPickable(['you']);
+    else if (myTurn) scene.setPickable(livingFoeSlots);
+    else scene.setPickable([]);
+
+    const actingSlot = display.phase === 'battle' && display.turn ? slotForSide(display, display.turn) : null;
+    scene.setActingSlot(actingSlot);
+  }, [display, busy, deploying, myTurn, livingFoeSlots]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -243,22 +335,22 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   }, [deploying, selKey, orient, draft]);
 
   const handlePick = useCallback(
-    (idx: number) => {
+    (hit: BoardHit) => {
       const scene = sceneRef.current;
       if (!scene || !display || busy) return;
 
       if (deploying) {
-        if (!selKey) return;
+        if (hit.slot !== 'you' || !selKey) return;
         const def = defFor(selKey);
         if (!def) return;
-        const cells = cellsFor(idx, def.len, orient);
+        const cells = cellsFor(hit.idx, def.len, orient);
         const taken = new Set(draft.flatMap((p) => p.cells));
         if (!cells || cells.some((c) => taken.has(c))) return;
 
         const placement: Placement = { key: selKey, orient, cells };
         const next = [...draft.filter((p) => p.key !== selKey), placement];
         scene.click();
-        scene.setMyFleet([placement]);
+        scene.setFleet('you', [placement]);
         setDraft(next);
         pushLog('POS', `${def.name} set at ${cellName(cells[0])}`);
         const remaining = SHIP_DEFS.map((d) => d.key).filter((k) => !next.some((p) => p.key === k));
@@ -266,7 +358,10 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
         return;
       }
 
-      if (myTurn) void adapter.fire(idx);
+      if (myTurn) {
+        const side = sideForSlot(display, hit.slot);
+        if (side) void adapter.fire(side, hit.idx);
+      }
     },
     [adapter, busy, deploying, display, draft, myTurn, orient, pushLog, selKey],
   );
@@ -282,10 +377,10 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
         setOrient((o) => (o === 'H' ? 'V' : 'H'));
       }
       if (e.key === ' ') {
-        const idx = sceneRef.current?.hoverIndex() ?? -1;
-        if (idx >= 0) {
+        const hit = sceneRef.current?.hoverTarget() ?? null;
+        if (hit) {
           e.preventDefault();
-          pickRef.current(idx);
+          pickRef.current(hit);
         }
       }
     };
@@ -295,21 +390,18 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
 
   /* ---------------------------------------------------------------- controls ---- */
 
-  const selectShip = useCallback(
-    (key: ShipKey) => {
-      const scene = sceneRef.current;
-      setDraft((prev) => prev.filter((p) => p.key !== key));
-      scene?.clearShip('mine', key);
-      setSelKey(key);
-    },
-    [],
-  );
+  const selectShip = useCallback((key: ShipKey) => {
+    const scene = sceneRef.current;
+    setDraft((prev) => prev.filter((p) => p.key !== key));
+    scene?.clearShip('you', key);
+    setSelKey(key);
+  }, []);
 
   const randomise = useCallback(() => {
     const scene = sceneRef.current;
     const fleet = randomFleet();
-    scene?.clearFleet('mine');
-    scene?.setMyFleet(fleet);
+    scene?.clearFleet('you');
+    scene?.setFleet('you', fleet);
     scene?.click();
     setDraft(fleet);
     setSelKey(null);
@@ -317,7 +409,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   }, [pushLog]);
 
   const clearFleet = useCallback(() => {
-    sceneRef.current?.clearFleet('mine');
+    sceneRef.current?.clearFleet('you');
     setDraft([]);
     setSelKey(SHIP_DEFS[0].key);
   }, []);
@@ -344,9 +436,22 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   }, [inviteUrl]);
 
   const fireAtHover = useCallback(() => {
-    const idx = sceneRef.current?.hoverIndex() ?? -1;
-    if (idx >= 0) pickRef.current(idx);
+    const hit = sceneRef.current?.hoverTarget() ?? null;
+    if (hit) pickRef.current(hit);
   }, []);
+
+  const joinTeam = useCallback(
+    (team: Team) => {
+      void adapter.setTeam?.(team);
+    },
+    [adapter],
+  );
+  const setLobbyReady = useCallback(
+    (ready: boolean) => {
+      void adapter.setReady?.(ready);
+    },
+    [adapter],
+  );
 
   /* -------------------------------------------------------------------- copy ---- */
 
@@ -357,9 +462,13 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const turnLabel = (() => {
     if (!display) return 'CONNECTING';
     if (display.phase === 'over') return display.outcome === 'win' ? 'VICTORY' : 'DEFEAT';
-    if (display.phase === 'battle') return display.turn === 'you' ? 'YOUR TURN' : 'ENEMY TURN';
-    if (display.phase === 'lobby') return 'AWAITING FOE';
-    return display.you.ready ? 'STANDBY' : 'DEPLOYMENT';
+    if (display.phase === 'battle') {
+      if (display.turn === display.you) return 'YOUR TURN';
+      const actor = display.turn ? display.seats.find((s) => s.side === display.turn)?.name : null;
+      return actor ? `${actor.toUpperCase()}'S TURN` : 'ENEMY TURN';
+    }
+    if (display.phase === 'lobby') return display.mode === 'duo' ? 'LOBBY' : 'AWAITING FOE';
+    return yourSeat?.deployed ? 'STANDBY' : 'DEPLOYMENT';
   })();
 
   const phaseLabel = (() => {
@@ -371,12 +480,52 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
 
   const deployHint = (() => {
     if (!display) return 'Establishing link…';
-    if (display.phase === 'lobby' && allPlaced) return 'FLEET READY · WAITING FOR AN OPPONENT';
+    if (display.phase === 'lobby' && display.mode === 'duel' && allPlaced) {
+      return 'FLEET READY · WAITING FOR AN OPPONENT';
+    }
     if (selName) return `PLACING ${selName}  ·  ${orient === 'H' ? 'HORIZONTAL' : 'VERTICAL'}`;
     return allPlaced ? 'FLEET READY' : 'SELECT A SHIP FROM YOUR ROSTER';
   })();
 
+  const turnChips: TurnChip[] = display
+    ? display.turnOrder.map((side) => {
+        const seat = display.seats.find((s) => s.side === side)!;
+        return {
+          side,
+          name: seat.name ?? 'Commander',
+          team: seat.team,
+          isYou: side === display.you,
+          acting: display.turn === side,
+          eliminated: seat.eliminated,
+        };
+      })
+    : [];
+
+  const hoverBoardName =
+    display && display.mode === 'duo' && hover
+      ? assignSlots(display).find((a) => a.slot === hover.slot)?.seat.name ?? null
+      : null;
+
   const roomFatal = fatal ?? glFatal;
+
+  const showLobby = display?.phase === 'lobby' && display.mode === 'duo';
+  const showWaiting =
+    display?.phase === 'lobby' && display.mode === 'duel' && adapter.mode === 'online' && Boolean(adapter.roomId) && Boolean(inviteUrl);
+
+  const seatsByTeam: Record<Team, { name: string; ready: boolean; isYou: boolean }[]> = { red: [], blue: [] };
+  if (display) {
+    display.seats.forEach((s) => {
+      if (s.team) {
+        seatsByTeam[s.team].push({ name: s.name ?? 'Commander', ready: s.ready, isYou: s.side === display.you });
+      }
+    });
+  }
+  const lobbyBlockedReason = (() => {
+    if (!display) return null;
+    if (!yourSeat?.team) return 'Choose a team first';
+    if (seatsByTeam.red.length !== 2 || seatsByTeam.blue.length !== 2) return 'Waiting for the rest of the crew';
+    return null;
+  })();
 
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-abyss select-none">
@@ -386,40 +535,57 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
         <TopBar
           turnLabel={turnLabel}
           phaseLabel={phaseLabel}
-          urgent={battling && display?.turn === 'them'}
+          urgent={Boolean(battling && display?.turn !== display?.you)}
           muted={muted}
           onToggleMute={() => setMuted((m) => !m)}
           roomCode={adapter.mode === 'online' ? adapter.roomId : null}
-          opponent={display?.them.name ?? null}
+          opponent={display && display.mode === 'duel' ? foeSeats[0]?.name ?? null : null}
           onCopyInvite={inviteUrl ? copyInvite : undefined}
           copied={copied}
           onLeave={onLeave}
+          turnChips={turnChips}
         />
 
         {display ? (
           <>
             <div
-              className={`absolute top-[104px] left-5 hidden lg:block ${deploying ? 'pointer-events-auto' : ''}`}
+              className={`absolute top-[104px] left-5 hidden lg:flex lg:flex-col lg:gap-2 ${deploying ? 'pointer-events-auto' : ''}`}
             >
               <FleetPanel
                 title="Your fleet"
-                ships={display.you.ships}
+                ships={yourSeat?.ships ?? []}
                 mine
                 deploying={deploying}
                 selected={selKey}
                 placed={placedKeys}
                 onSelect={deploying ? selectShip : undefined}
+                team={yourSeat?.team ?? null}
               />
+              {allySeat ? (
+                <FleetPanel
+                  title="Ally fleet"
+                  ships={allySeat.ships}
+                  mine={false}
+                  deploying={false}
+                  team={allySeat.team}
+                  compact
+                />
+              ) : null}
             </div>
 
-            <div className="absolute top-[104px] right-5 hidden lg:block">
-              <FleetPanel
-                title="Enemy fleet"
-                ships={display.them.ships}
-                mine={false}
-                deploying={false}
-                align="right"
-              />
+            <div className="absolute top-[104px] right-5 hidden lg:flex lg:flex-col lg:gap-2">
+              {foeSeats.map((seat, i) => (
+                <FleetPanel
+                  key={seat.side}
+                  title={foeSeats.length > 1 ? seat.name ?? `Enemy ${i + 1}` : 'Enemy fleet'}
+                  ships={seat.ships}
+                  mine={false}
+                  deploying={false}
+                  align="right"
+                  team={seat.team}
+                  compact={foeSeats.length > 1}
+                />
+              ))}
             </div>
 
             <div className="absolute bottom-5 left-5 hidden sm:block">
@@ -428,7 +594,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
 
             <div className="hidden sm:block">
               <TargetReadout
-                label={hover == null ? '——' : cellName(hover)}
+                label={hover == null ? '——' : cellName(hover.idx)}
+                board={hoverBoardName}
                 active={hover != null}
               />
             </div>
@@ -454,12 +621,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
               </div>
             ) : null}
 
-            {display.phase === 'deploy' && display.you.ready ? (
-              <StandbyOverlay message="Awaiting enemy deployment" />
+            {display.phase === 'deploy' && yourSeat?.deployed ? (
+              <StandbyOverlay message="Awaiting the rest of the crew" />
             ) : null}
 
-            {battling && display.turn === 'them' && !busy ? (
-              <StandbyOverlay message="Enemy is taking aim" />
+            {battling && display.turn !== display.you && !busy ? (
+              <StandbyOverlay message={turnLabel === 'ENEMY TURN' ? 'Enemy is taking aim' : `${turnLabel.replace("'S TURN", '')} is taking aim`} />
             ) : null}
           </>
         ) : null}
@@ -486,25 +653,43 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           </div>
         ) : null}
 
-        {display?.phase === 'lobby' && adapter.mode === 'online' && adapter.roomId && inviteUrl ? (
+        {showWaiting && display ? (
           <WaitingOverlay
-            roomCode={adapter.roomId}
+            roomCode={adapter.roomId as string}
+            inviteUrl={inviteUrl as string}
+            onCopy={copyInvite}
+            copied={copied}
+          />
+        ) : null}
+
+        {showLobby && display && inviteUrl ? (
+          <LobbyOverlay
+            roomCode={adapter.roomId ?? display.roomId}
             inviteUrl={inviteUrl}
             onCopy={copyInvite}
             copied={copied}
+            yourTeam={yourSeat?.team ?? null}
+            yourReady={yourSeat?.ready ?? false}
+            seatsByTeam={seatsByTeam}
+            canReady={!lobbyBlockedReason}
+            reasonBlocked={lobbyBlockedReason}
+            onJoinTeam={joinTeam}
+            onSetReady={setLobbyReady}
           />
         ) : null}
 
         {display?.phase === 'over' && display.outcome ? (
           <OverOverlay
             outcome={display.outcome}
-            shots={display.you.shotsFired}
-            hits={display.you.hitsLanded}
+            shots={yourSeat?.shotsFired ?? 0}
+            hits={yourSeat?.hitsLanded ?? 0}
             onRematch={() => void adapter.rematch()}
-            rematchPending={display.you.rematch}
-            opponentWantsRematch={display.them.rematch}
-            opponentPresent={display.them.present}
+            rematchPending={yourSeat?.rematch ?? false}
+            others={display.seats
+              .filter((s) => s.relation !== 'self')
+              .map((s) => ({ name: s.name ?? 'Commander', present: s.present, rematch: s.rematch }))}
             soloMode={adapter.mode === 'solo'}
+            ally={allySeat ? { name: allySeat.name ?? 'Ally', shots: allySeat.shotsFired, hits: allySeat.hitsLanded } : null}
           />
         ) : null}
 

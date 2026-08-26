@@ -53,7 +53,17 @@ export function FireBar({ onFire, disabled }: { onFire: () => void; disabled: bo
   );
 }
 
-export function TargetReadout({ label, active }: { label: string; active: boolean }) {
+
+export function TargetReadout({
+  label,
+  board,
+  active,
+}: {
+  label: string;
+  /** Which enemy fleet the cell belongs to — ambiguous once there are two. */
+  board?: string | null;
+  active: boolean;
+}) {
   return (
     <div className="absolute right-5 bottom-5 text-right">
       <p className="stencil mb-1.5 text-brass/75">Target</p>
@@ -63,7 +73,7 @@ export function TargetReadout({ label, active }: { label: string; active: boolea
           active ? 'text-flare' : 'text-parchment/25',
         ].join(' ')}
       >
-        {label}
+        {board ? `${board} · ${label}` : label}
       </p>
       <p className="mt-1.5 font-mono text-[9px] font-light leading-normal tracking-[0.1em] text-parchment/35">
         Drag orbit · Wheel zoom

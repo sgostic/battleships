@@ -9,6 +9,7 @@
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { Btn } from '@/components/hud/Btn';
+import type { Mode } from '@/lib/game/match';
 import {
   createRoom,
   quickMatch,
@@ -40,6 +41,7 @@ export function PortConsole() {
   const name = typedName ?? storedName;
   const setName = setTypedName;
   const [code, setCode] = useState('');
+  const [mode, setMode] = useState<Mode>('duel');
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
   const [storeWarning, setStoreWarning] = useState<string | null>(null);
@@ -123,21 +125,40 @@ export function PortConsole() {
             />
           </label>
 
-          <div className="mt-6 flex flex-col gap-2">
+          <div className="mt-6 flex justify-center gap-2">
+            <Btn
+              tone={mode === 'duel' ? 'primary' : 'default'}
+              onClick={() => setMode('duel')}
+              disabled={busy !== null}
+              className="flex-1"
+            >
+              1v1
+            </Btn>
+            <Btn
+              tone={mode === 'duo' ? 'primary' : 'default'}
+              onClick={() => setMode('duo')}
+              disabled={busy !== null}
+              className="flex-1"
+            >
+              2v2
+            </Btn>
+          </div>
+
+          <div className="mt-3 flex flex-col gap-2">
             <Btn
               tone="primary"
-              onClick={() => void run('quick', () => quickMatch(name))}
+              onClick={() => void run('quick', () => quickMatch(name, mode))}
               disabled={busy !== null}
               className="w-full py-3.5 text-[10.5px]"
             >
               {busy === 'quick' ? 'Finding an opponent…' : 'Quick match'}
             </Btn>
             <Btn
-              onClick={() => void run('create', () => createRoom(name))}
+              onClick={() => void run('create', () => createRoom(name, { mode }))}
               disabled={busy !== null}
               className="w-full py-3.5 text-[10.5px]"
             >
-              {busy === 'create' ? 'Opening room…' : 'Create private room'}
+              {busy === 'create' ? 'Opening room…' : `Create private room${mode === 'duo' ? ' (2v2)' : ''}`}
             </Btn>
           </div>
 
