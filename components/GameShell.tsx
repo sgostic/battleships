@@ -755,6 +755,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
             inviteUrl={inviteUrl as string}
             onCopy={copyInvite}
             copied={copied}
+            onCancel={onLeave ?? (() => {})}
           />
         ) : null}
 
@@ -771,6 +772,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
             reasonBlocked={lobbyBlockedReason}
             onJoinTeam={joinTeam}
             onSetReady={setLobbyReady}
+            onCancel={onLeave ?? (() => {})}
           />
         ) : null}
 

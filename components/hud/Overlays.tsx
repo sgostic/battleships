@@ -66,9 +66,10 @@ export type WaitingOverlayProps = {
   inviteUrl: string;
   onCopy: () => void;
   copied: boolean;
+  onCancel: () => void;
 };
 
-export function WaitingOverlay({ roomCode, inviteUrl, onCopy, copied }: WaitingOverlayProps) {
+export function WaitingOverlay({ roomCode, inviteUrl, onCopy, copied, onCancel }: WaitingOverlayProps) {
   return (
     <Shell label="Awaiting challenger">
       <h2 className="stencil text-brass">Awaiting challenger</h2>
@@ -86,9 +87,7 @@ export function WaitingOverlay({ roomCode, inviteUrl, onCopy, copied }: WaitingO
         <Btn tone="primary" onClick={onCopy}>
           {copied ? 'Copied' : 'Copy invite'}
         </Btn>
-        <Link href="/">
-          <Btn>Cancel</Btn>
-        </Link>
+        <Btn onClick={onCancel}>Cancel</Btn>
       </div>
     </Shell>
   );
@@ -145,6 +144,7 @@ export type LobbyOverlayProps = {
   reasonBlocked: string | null;
   onJoinTeam: (team: Team) => void;
   onSetReady: (ready: boolean) => void;
+  onCancel: () => void;
 };
 
 const TEAM_LABEL: Record<Team, string> = { red: 'Team Red', blue: 'Team Blue' };
@@ -206,6 +206,7 @@ export function LobbyOverlay({
   reasonBlocked,
   onJoinTeam,
   onSetReady,
+  onCancel,
 }: LobbyOverlayProps) {
   const readyCount = seatsByTeam.red.filter((s) => s.ready).length + seatsByTeam.blue.filter((s) => s.ready).length;
   const totalSeats = seatsByTeam.red.length + seatsByTeam.blue.length;
@@ -238,9 +239,7 @@ export function LobbyOverlay({
           {yourReady ? 'Not ready' : 'Ready'}
         </Btn>
         <Btn onClick={onCopy}>{copied ? 'Copied' : 'Copy invite'}</Btn>
-        <Link href="/">
-          <Btn>Cancel</Btn>
-        </Link>
+        <Btn onClick={onCancel}>Cancel</Btn>
       </div>
       <p className="mt-3 truncate font-mono text-[10px] tracking-[0.04em] text-parchment/35">{inviteUrl}</p>
     </Shell>
