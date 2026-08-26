@@ -49,6 +49,7 @@ export type GameShellProps = {
   fatal?: string | null;
   inviteUrl?: string;
   onLeave?: () => void;
+  onNicknameSubmit?: (name: string) => void;
 };
 
 /* ------------------------------------------------------------ slot mapping ---- */
@@ -91,7 +92,7 @@ function seatSpec(seat: SeatView, slot: Slot): SlotSpec {
   };
 }
 
-export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShellProps) {
+export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknameSubmit }: GameShellProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<SeaBattleScene | null>(null);
 
@@ -334,6 +335,14 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
   const myTurn = battling && display?.turn === display?.you;
   const specialMoveOffer = Boolean(display?.specialMoveOffer);
   const specialDecisionSent = specialDecisionVersion === display?.version;
+
+  // Online snapshots and the Three.js scene initialize independently. Syncing
+  // from the committed display guarantees that a teammate who joins after the
+  // first snapshot gets a board even if the initial scene sync ran too early.
+  useEffect(() => {
+    if (display) syncSceneRoster(display);
+  }, [display, syncSceneRoster]);
+
   useEffect(() => {
     if (adapter.mode !== 'solo' || specialDecisionSent || !specialMoveOffer || !adapter.respondSpecialMove) return;
     const delay = Math.max(0, (display?.specialMoveExpiresAt ?? Date.now() + 20_000) - Date.now());
@@ -794,7 +803,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           />
         ) : null}
 
-        {roomFatal ? <FatalOverlay message={roomFatal} /> : null}
+        {roomFatal ? <FatalOverlay message={roomFatal} onNicknameSubmit={onNicknameSubmit} /> : null}
 
         {adapter.error && !roomFatal ? (
           <ErrorToast message={adapter.error} onDismiss={adapter.clearError} />

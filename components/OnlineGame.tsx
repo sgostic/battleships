@@ -3,7 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { GameShell } from '@/components/GameShell';
-import { forgetSession, leaveRoom } from '@/lib/net/client';
+import { forgetSession, leaveRoom, rememberName } from '@/lib/net/client';
 import { useOnlineMatch } from '@/lib/net/useOnlineMatch';
 
 /** The page origin is browser-only, so read it as an external store. */
@@ -54,5 +54,10 @@ export function OnlineGame({ roomId }: { roomId: string }) {
     router.push('/');
   }, [match.token, roomId, router]);
 
-  return <GameShell adapter={match} fatal={match.fatal} inviteUrl={inviteUrl} onLeave={leave} />;
+  const submitNickname = useCallback((name: string) => {
+    rememberName(name);
+    match.retry();
+  }, [match]);
+
+  return <GameShell adapter={match} fatal={match.fatal} inviteUrl={inviteUrl} onLeave={leave} onNicknameSubmit={submitNickname} />;
 }

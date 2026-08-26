@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { useState } from 'react';
 import type { SeatView, Side, Team } from '@/lib/game/match';
 import { Btn } from './Btn';
 
@@ -19,7 +20,10 @@ function Shell({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-export function FatalOverlay({ message }: { message: string }) {
+export function FatalOverlay({ message, onNicknameSubmit }: { message: string; onNicknameSubmit?: (name: string) => void }) {
+  const [name, setName] = useState('');
+  const needsNickname = message.toLowerCase().includes('nickname');
+
   return (
     <Shell label="No signal">
       <h2 className="font-display text-[15px] font-semibold leading-snug tracking-[0.2em] text-parchment">
@@ -28,9 +32,31 @@ export function FatalOverlay({ message }: { message: string }) {
       <p className="mt-3 font-mono text-[11px] font-light leading-relaxed tracking-[0.06em] text-parchment/60">
         {message}
       </p>
-      <Link href="/" className="mt-6 inline-block">
-        <Btn>Back to port</Btn>
-      </Link>
+      {needsNickname && onNicknameSubmit ? (
+        <form
+          className="mt-5 flex flex-col items-center gap-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (name.trim()) onNicknameSubmit(name.trim());
+          }}
+        >
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            autoFocus
+            required
+            maxLength={18}
+            placeholder="Enter your nickname"
+            aria-label="Nickname"
+            className="w-full border border-brass/30 bg-abyss/60 px-3 py-2.5 text-center font-mono text-[13px] tracking-[0.1em] text-parchment placeholder:text-parchment/25 focus:border-brass/70 focus:outline-none"
+          />
+          <Btn type="submit" tone="primary">Join room</Btn>
+        </form>
+      ) : (
+        <Link href="/" className="mt-6 inline-block">
+          <Btn>Back to port</Btn>
+        </Link>
+      )}
     </Shell>
   );
 }
