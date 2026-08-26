@@ -197,6 +197,7 @@ export function deploy(state: MatchState, side: Side, fleet: unknown, now: numbe
     return fail(state.phase === 'lobby' ? 'Waiting for an opponent' : 'Deployment has closed', 409);
   }
   if (player.ships) return fail('Your fleet is already deployed', 409);
+  player.lastSeen = now;
 
   const check = validateFleet(fleet);
   if (!check.ok) return fail(check.error, 422);
@@ -228,6 +229,7 @@ export function fire(state: MatchState, side: Side, idx: unknown, now: number): 
   if (!target?.ships) return fail('Opponent has not deployed', 409);
   if (target.incoming[idx] !== 0) return fail('You already fired at that cell', 409);
 
+  shooter.lastSeen = now;
   const ship = target.ships.find((s) => !s.sunk && s.cells.includes(idx));
   const hit = Boolean(ship);
   target.incoming[idx] = hit ? 2 : 1;
@@ -277,6 +279,7 @@ export function requestRematch(
   if (state.phase !== 'over') return fail('The battle is still live', 409);
 
   player.rematch = true;
+  player.lastSeen = now;
   const both = Boolean(state.players.a?.rematch && state.players.b?.rematch);
   if (both) {
     (['a', 'b'] as const).forEach((s) => {

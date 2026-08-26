@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
-import { markSeen, sideForToken, viewFor } from '@/lib/game/match';
+import { sideForToken, viewFor } from '@/lib/game/match';
 import { jsonError, parseSince, readToken, resolveRoomId } from '@/lib/net/api';
-import { loadRoom, saveRoom, waitForVersion } from '@/lib/net/rooms';
+import { loadRoom, waitForVersion } from '@/lib/net/rooms';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -37,14 +37,14 @@ export async function GET(request: NextRequest, ctx: { params: Promise<{ id: str
       })) ?? state;
   }
 
-  // Heartbeat so the opponent can tell whether you are still at the table.
-  const stillSeated = sideForToken(state, token);
-  if (stillSeated) markSeen(state, stillSeated, Date.now());
+  // This handler never writes. It used to stamp a lastSeen heartbeat here, but
+  // the state it holds was read outside the room lock: any join, deploy, or shot
+  // committed during the hold would be clobbered by the write, stranding both
+  // players. Reads stay read-only; lastSeen is stamped by the mutating routes.
+  const seatNow = sideForToken(state, token) ?? side;
 
-  const response = Response.json(
-    { view: viewFor(state, stillSeated ?? side, since) },
+  return Response.json(
+    { view: viewFor(state, seatNow, since) },
     { headers: { 'cache-control': 'no-store' } },
   );
-  if (stillSeated) await saveRoom(state);
-  return response;
 }

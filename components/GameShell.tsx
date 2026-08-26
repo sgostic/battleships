@@ -155,7 +155,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave }: GameShe
           break;
         }
         case 'over':
-          pushLog('CMD', event.winner === you ? 'Enemy fleet destroyed' : 'Your fleet is lost');
+          if (event.winner === you) {
+            // A walkout also ends the match, so do not claim a kill we did not make.
+            pushLog('CMD', view.them.present ? 'Enemy fleet destroyed' : 'Opponent forfeited');
+          } else {
+            pushLog('CMD', 'Your fleet is lost');
+          }
           break;
         case 'left':
           if (event.side !== you) pushLog('ERR', 'Opponent left the theater');

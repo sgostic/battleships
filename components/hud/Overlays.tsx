@@ -3,9 +3,14 @@
 import Link from 'next/link';
 import { Btn } from './Btn';
 
-function Shell({ children }: { children: React.ReactNode }) {
+function Shell({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="pointer-events-auto absolute inset-0 flex animate-sb-fade items-center justify-center bg-[rgba(5,14,19,.72)] px-6 backdrop-blur-[3px]">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+      className="pointer-events-auto absolute inset-0 flex animate-sb-fade items-center justify-center bg-[rgba(5,14,19,.72)] px-6 backdrop-blur-[3px]"
+    >
       <div className="w-[min(460px,88vw)] border border-brass/40 bg-[rgba(8,22,28,.9)] px-8 pt-8 pb-7 text-center">
         {children}
       </div>
@@ -15,7 +20,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 
 export function FatalOverlay({ message }: { message: string }) {
   return (
-    <Shell>
+    <Shell label="No signal">
       <h2 className="font-display text-[15px] font-semibold leading-snug tracking-[0.2em] text-parchment">
         NO SIGNAL
       </h2>
@@ -38,7 +43,7 @@ export type WaitingOverlayProps = {
 
 export function WaitingOverlay({ roomCode, inviteUrl, onCopy, copied }: WaitingOverlayProps) {
   return (
-    <Shell>
+    <Shell label="Awaiting challenger">
       <h2 className="stencil text-brass">Awaiting challenger</h2>
       <p className="mt-4 font-mono text-[38px] leading-none tracking-[0.3em] text-flare">
         {roomCode}
@@ -95,7 +100,7 @@ export function OverOverlay({
   const won = outcome === 'win';
 
   return (
-    <Shell>
+    <Shell label={won ? 'Victory' : 'Defeat'}>
       <h2
         className={[
           'font-display text-[30px] font-semibold leading-none tracking-[0.3em]',
