@@ -3,15 +3,15 @@
 /* The design's naval palette, exposed to Tailwind as utilities:
    bg-abyss, text-parchment, border-brass/30, text-ember, and so on. */
 @theme {
-  --color-abyss: #07161c;
-  --color-hull: #081a20;
-  --color-slate-deep: #0d2530;
-  --color-parchment: #f2e4c9;
-  --color-brass: #c8a15c;
-  --color-flare: #ffd9a0;
-  --color-ember: #ff7a2f;
-  --color-scorch: #e04b28;
-  --color-foam: #bedce0;
+  --color-abyss: #0b2634;
+  --color-hull: #123746;
+  --color-slate-deep: #1b4555;
+  --color-parchment: #fff0d2;
+  --color-brass: #f0bc62;
+  --color-flare: #ffe2a3;
+  --color-ember: #ff8b3d;
+  --color-scorch: #f05a3d;
+  --color-foam: #c8f4f2;
 
   --font-display: var(--font-spectral), Georgia, "Times New Roman", serif;
   --font-mono: var(--font-azeret), ui-monospace, "SF Mono", monospace;

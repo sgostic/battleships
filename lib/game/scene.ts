@@ -49,7 +49,7 @@ export type SceneOptions = {
   onFatal?: (message: string) => void;
 };
 
-const TEAM_COLOR: Record<'red' | 'blue', number> = { red: 0xe04b28, blue: 0x4f9aa8 };
+const TEAM_COLOR: Record<'red' | 'blue', number> = { red: 0xf05a3d, blue: 0x42c1d3 };
 
 type ShipVisual = {
   key: ShipKey;
@@ -129,7 +129,7 @@ type Tween = { t: number; d: number; fn: (u: number) => void; done?: () => void 
 
 type Sfx = 'cannon' | 'whistle' | 'splash' | 'boom' | 'sink' | 'gull' | 'click';
 
-const HORIZON_HEX = '#cf9a6a';
+const HORIZON_HEX = '#f1b477';
 
 export class SeaBattleScene {
   private readonly canvas: HTMLCanvasElement;
@@ -229,7 +229,7 @@ export class SeaBattleScene {
     this.onHover = opts.onHover;
     this.onPick = opts.onPick;
     this.amp = opts.waveHeight ?? 1;
-    this.fireHex = opts.fireColor ?? '#ff7a2f';
+    this.fireHex = opts.fireColor ?? '#ff8b3d';
     this.fire = new THREE.Color(this.fireHex);
 
     this.initRenderer();
@@ -262,7 +262,7 @@ export class SeaBattleScene {
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.06;
+    renderer.toneMappingExposure = 1.22;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.autoUpdate = false;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -277,7 +277,7 @@ export class SeaBattleScene {
       Math.PI - 0.62,
     );
 
-    const sun = new THREE.DirectionalLight(0xffc078, 3.1);
+    const sun = new THREE.DirectionalLight(0xffc078, 3.7);
     sun.position.copy(this.sunDir).multiplyScalar(110);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
@@ -291,8 +291,8 @@ export class SeaBattleScene {
     sun.shadow.bias = -0.0008;
     sun.shadow.normalBias = 0.02;
     this.scene.add(sun);
-    this.scene.add(new THREE.HemisphereLight(0xffd9a8, 0x0f3a44, 0.55));
-    const fill = new THREE.DirectionalLight(0x74b6cc, 0.6);
+    this.scene.add(new THREE.HemisphereLight(0xffe1ae, 0x1d6072, 0.82));
+    const fill = new THREE.DirectionalLight(0x8bd5e5, 0.9);
     fill.position.set(-8, -3, 10);
     this.scene.add(fill);
   }
@@ -462,9 +462,9 @@ export class SeaBattleScene {
     x.fillRect(0, 0, 16, 128);
     this.tex.col = new THREE.CanvasTexture(c);
 
-    this.tex.steel = this.panelTex('#767f83', { rust: 0.9, lines: 26 });
-    this.tex.steelDark = this.panelTex('#454e53', { rust: 0.5, lines: 18 });
-    this.tex.hullRed = this.panelTex('#7d3a2c', { rust: 1.4, lines: 10 });
+    this.tex.steel = this.panelTex('#8eabb0', { rust: 0.7, lines: 26 });
+    this.tex.steelDark = this.panelTex('#58737a', { rust: 0.4, lines: 18 });
+    this.tex.hullRed = this.panelTex('#a84f3c', { rust: 1.1, lines: 10 });
     this.tex.deck = this.deckTex();
     this.tex.flight = this.flightTex();
     this.tex.labelsA = this.labelTex('ABCDEFGHIJ'.split(''));
@@ -620,9 +620,9 @@ export class SeaBattleScene {
       depthWrite: false,
       fog: false,
       uniforms: {
-        uTop: { value: new THREE.Color('#2a6f86') },
-        uHoriz: { value: new THREE.Color('#f0b071') },
-        uSunCol: { value: new THREE.Color('#ffd3a0') },
+        uTop: { value: new THREE.Color('#58a6c1') },
+        uHoriz: { value: new THREE.Color('#ffc27d') },
+        uSunCol: { value: new THREE.Color('#ffe0a8') },
         uSun: { value: this.sunDir.clone() },
       },
       vertexShader:
@@ -649,10 +649,10 @@ export class SeaBattleScene {
         uAmp: { value: this.amp },
         uSun: { value: this.sunDir.clone() },
         uCam: { value: new THREE.Vector3() },
-        uDeep: { value: new THREE.Color('#0a3240') },
-        uShallow: { value: new THREE.Color('#1d6a71') },
+        uDeep: { value: new THREE.Color('#15556a') },
+        uShallow: { value: new THREE.Color('#299d99') },
         uHorizon: { value: new THREE.Color(HORIZON_HEX) },
-        uSunCol: { value: new THREE.Color('#ffcf9a') },
+        uSunCol: { value: new THREE.Color('#ffdb9c') },
         uFogDens: { value: 0.0085 },
       },
       vertexShader: [
@@ -727,22 +727,37 @@ export class SeaBattleScene {
     if (this.materials[name]) return this.materials[name];
     const T = this.tex;
     const defs: Record<string, THREE.MeshStandardMaterialParameters> = {
-      steel: { map: T.steel, color: 0xa8b0b4, roughness: 0.62, metalness: 0.55 },
-      dark: { map: T.steelDark, color: 0x9aa2a7, roughness: 0.5, metalness: 0.7 },
-      red: { map: T.hullRed, color: 0xb4664f, roughness: 0.8, metalness: 0.25 },
-      deck: { map: T.deck, color: 0xbfb49b, roughness: 0.85, metalness: 0.08 },
-      flight: { map: T.flight, color: 0x9aa0a4, roughness: 0.9, metalness: 0.1 },
-      brass: { color: 0xc8a15c, roughness: 0.34, metalness: 0.92 },
-      cream: { color: 0xd8cbb0, roughness: 0.66, metalness: 0.15 },
+      steel: {
+        map: T.steel, color: 0xd5e5e4, emissive: 0x24464a, emissiveIntensity: 0.18,
+        roughness: 0.62, metalness: 0.55,
+      },
+      dark: {
+        map: T.steelDark, color: 0xbcd3d3, emissive: 0x1d454d, emissiveIntensity: 0.24,
+        roughness: 0.5, metalness: 0.7,
+      },
+      red: {
+        map: T.hullRed, color: 0xef9578, emissive: 0x5d1d13, emissiveIntensity: 0.2,
+        roughness: 0.8, metalness: 0.25,
+      },
+      deck: {
+        map: T.deck, color: 0xe6d6ae, emissive: 0x4b391e, emissiveIntensity: 0.12,
+        roughness: 0.85, metalness: 0.08,
+      },
+      flight: {
+        map: T.flight, color: 0xd2e0e0, emissive: 0x29494e, emissiveIntensity: 0.14,
+        roughness: 0.9, metalness: 0.1,
+      },
+      brass: { color: 0xf0bc62, roughness: 0.34, metalness: 0.92 },
+      cream: { color: 0xffedc8, emissive: 0x5b4728, emissiveIntensity: 0.1, roughness: 0.66, metalness: 0.15 },
       glass: {
-        color: 0x1b4c56,
+        color: 0x327a87,
         roughness: 0.18,
         metalness: 0.2,
         transparent: true,
-        opacity: 0.26,
+        opacity: 0.34,
         side: THREE.DoubleSide,
       },
-      black: { color: 0x1b2226, roughness: 0.55, metalness: 0.4 },
+      black: { color: 0x46666b, emissive: 0x173842, emissiveIntensity: 0.18, roughness: 0.55, metalness: 0.4 },
     };
     this.materials[name] = new THREE.MeshStandardMaterial(defs[name]);
     return this.materials[name];
@@ -838,7 +853,7 @@ export class SeaBattleScene {
     const x = c.getContext('2d')!;
     const hex = spec.team ? TEAM_COLOR[spec.team] : 0x8c9296;
     const teamCss = `#${hex.toString(16).padStart(6, '0')}`;
-    x.fillStyle = 'rgba(7,22,28,.62)';
+    x.fillStyle = 'rgba(12,47,61,.7)';
     x.fillRect(0, 0, W, H);
     x.strokeStyle = teamCss;
     x.lineWidth = 4;
@@ -908,7 +923,7 @@ export class SeaBattleScene {
     grp.add(
       new THREE.LineSegments(
         gg,
-        new THREE.LineBasicMaterial({ color: 0xe6f2f2, transparent: true, opacity: 0.5 }),
+        new THREE.LineBasicMaterial({ color: 0xf3ffff, transparent: true, opacity: 0.68 }),
       ),
     );
 
@@ -1010,7 +1025,7 @@ export class SeaBattleScene {
         transparent: true,
         opacity: 0.26,
         depthWrite: false,
-        color: 0xd6e4e6,
+        color: 0xd9f2f1,
       }),
     );
     blanket.rotation.x = -Math.PI / 2;

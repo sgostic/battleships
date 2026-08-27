@@ -105,7 +105,7 @@ export function PortConsole() {
       {/* Golden-hour wash behind the console. */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 bg-[radial-gradient(120%_90%_at_50%_120%,rgba(207,154,106,.35),transparent_60%),radial-gradient(70%_50%_at_50%_0%,rgba(42,111,134,.28),transparent_70%)]"
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(120%_90%_at_50%_120%,rgba(255,183,105,.52),transparent_60%),radial-gradient(70%_55%_at_50%_0%,rgba(66,160,195,.46),transparent_70%)]"
       />
 
       <div className="relative w-full max-w-lg animate-sb-fade">
@@ -117,7 +117,7 @@ export function PortConsole() {
           <div className="mx-auto mt-5 h-px w-[120px] bg-gradient-to-r from-transparent via-brass/70 to-transparent" />
         </header>
 
-        <section className="mt-8 border border-brass/30 bg-[rgba(7,20,26,.62)] p-6 backdrop-blur-md sm:p-8">
+        <section className="mt-8 border border-brass/55 bg-[rgba(12,47,61,.74)] p-6 shadow-[0_18px_65px_rgba(2,21,31,.28)] backdrop-blur-md sm:p-8">
           <label className="block">
             <span className="stencil text-brass">Commander</span>
             <input

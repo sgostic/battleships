@@ -628,7 +628,7 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
 }
 
 export function autoFire(state: MatchState, side: Side, now: number): Result<{ target: Side; idx: number }> {
-  if (state.turnStartedAt === null || now - state.turnStartedAt < 12_000) return fail('The shot clock has not expired', 409);
+  if (state.turnStartedAt === null || now - state.turnStartedAt < 20_000) return fail('The shot clock has not expired', 409);
   const protectedSide = state.specialMove?.bastion?.activeEnemy === side ? state.specialMove.bastion.protectedSide : null;
   const choices = seatsOf(state).flatMap((target) => {
     const player = state.players[target];

@@ -149,7 +149,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
   useEffect(() => {
     if (!view || view.phase !== 'battle' || view.turn !== view.you || view.turnStartedAt === null) return;
     // Add a small grace period for clock skew between the browser and server.
-    const timer = window.setTimeout(() => void guard((t) => postAutoFire(roomId, t, 0)), Math.max(0, view.turnStartedAt + 12_000 - Date.now() + 500));
+    const timer = window.setTimeout(() => void guard((t) => postAutoFire(roomId, t, 0)), Math.max(0, view.turnStartedAt + 20_000 - Date.now() + 500));
     return () => window.clearTimeout(timer);
   }, [guard, roomId, view]);
   const setTeam = useCallback(

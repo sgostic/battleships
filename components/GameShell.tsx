@@ -411,7 +411,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
       const choices = targets.flatMap((seat) => seat.board.flatMap((mark, idx) => (mark === 0 ? [{ side: seat.side, idx }] : [])));
       const choice = choices[Math.floor(Math.random() * choices.length)];
       if (choice) void adapterRef.current.fire(choice.side, choice.idx);
-    }, Math.max(0, (display.turnStartedAt ?? Date.now()) + 12_000 - Date.now()));
+    }, Math.max(0, (display.turnStartedAt ?? Date.now()) + 20_000 - Date.now()));
     return () => window.clearTimeout(timer);
   }, [adapter.mode, display, myTurn, specialModalOpen]);
   useEffect(() => {
@@ -434,7 +434,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     return () => window.clearInterval(timer);
   }, [myTurn]);
   const shotSeconds = myTurn && display?.turnStartedAt !== null
-    ? Math.max(0, Math.ceil((display!.turnStartedAt! + 12_000 - now) / 1000))
+    ? Math.max(0, Math.ceil((display!.turnStartedAt! + 20_000 - now) / 1000))
     : null;
 
   const livingFoeSlots = useMemo(() => {
@@ -676,7 +676,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
       {turnAlert && !specialModalOpen ? (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
-          <div className="animate-sb-turn-alert border-y border-brass/80 bg-[rgba(7,22,28,.88)] px-10 py-5 text-center shadow-[0_0_60px_rgba(255,122,47,.28)]">
+          <div className="animate-sb-turn-alert border-y border-brass bg-[rgba(10,44,57,.9)] px-10 py-5 text-center shadow-[0_0_60px_rgba(255,151,63,.4)]">
             <p className="stencil mb-2 text-brass">Battle stations</p>
             <p className="font-display text-4xl font-bold tracking-[0.18em] text-flare sm:text-6xl">YOUR TURN</p>
           </div>
@@ -685,7 +685,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
       {specialCallout ? (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
-          <div className="animate-sb-special-callout border-y border-flare/80 bg-[rgba(27,10,4,.88)] px-10 py-6 text-center shadow-[0_0_90px_rgba(255,84,24,.5)]">
+          <div className="animate-sb-special-callout border-y border-flare bg-[rgba(78,30,12,.9)] px-10 py-6 text-center shadow-[0_0_90px_rgba(255,103,39,.62)]">
             <p className="stencil mb-3 text-brass">TACTICAL ACTION DEPLOYED</p>
             <p className="font-display text-3xl font-bold tracking-[0.18em] text-parchment sm:text-5xl">{specialCallout.action}</p>
             <p className="mt-3 font-mono text-[11px] tracking-[0.22em] text-flare">{specialCallout.name.toUpperCase()}</p>
