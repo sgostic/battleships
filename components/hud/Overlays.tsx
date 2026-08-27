@@ -118,7 +118,7 @@ export function SpecialMoveOverlay({ kind, foes, onAccept, onClose }: {
       <h2 className="mt-3 font-display text-[22px] font-semibold tracking-[0.15em] text-flare">{scorchedEarth ? 'SCORCHED EARTH' : rapidSalvo ? 'RAPID SALVO' : alliedBastion ? 'ALLIED BASTION' : 'TRAITOR\'S MARK'}</h2>
       <p className="mt-4 font-mono text-[11px] leading-relaxed tracking-[0.06em] text-parchment/70">
         {scorchedEarth
-          ? 'Bomb 50% of your teammate’s board at random, then immediately destroy two ships on one enemy fleet.'
+          ? 'Bomb 30% of your teammate’s board at random, then immediately destroy two ships on one enemy fleet.'
           : rapidSalvo
             ? 'Take two shots immediately. In exchange, your teammate’s next three turns will be skipped.'
             : alliedBastion

@@ -29,6 +29,7 @@ import {
   WaitingOverlay,
 } from '@/components/hud/Overlays';
 import { Chat } from '@/components/hud/Chat';
+import { SpectatorList } from '@/components/hud/SpectatorList';
 import { TacticalActions } from '@/components/hud/TacticalActions';
 import { type TurnChip, TopBar } from '@/components/hud/TopBar';
 import type { MatchAdapter } from '@/lib/game/adapter';
@@ -755,12 +756,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
               <Chat messages={display.chat} you={display.you} onSend={adapter.sendChat} />
             </div>
 
+            <div className="absolute right-5 bottom-5 hidden sm:block">
+              <SpectatorList spectators={display.spectators} />
+            </div>
+
             {battling && display.mode === 'duo' && adapter.useSpecialMove ? (
               <TacticalActions
                 actions={[
                   {
                     kind: 'scorched-earth', icon: '✹', code: 'ORD-01', name: 'Scorched Earth',
-                    detail: 'Destroy 2 enemy ships · bomb 50% of ally grid',
+                    detail: 'Destroy 2 enemy ships · bomb 30% of ally grid',
                     available: display.specials['scorched-earth'], active: canUseSpecial('scorched-earth'),
                     onActivate: canUseSpecial('scorched-earth')
                       ? () => openSpecial('scorched-earth')

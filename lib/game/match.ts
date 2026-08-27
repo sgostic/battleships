@@ -66,6 +66,13 @@ export type PlayerState = {
   lastSeen: number;
 };
 
+/** Read-only visitor identity. The token stays server-side. */
+export type SpectatorState = {
+  token: string;
+  name: string;
+  joinedAt: number;
+};
+
 export type SunkReveal = Placement & { name: string };
 
 export type MatchEvent =
@@ -114,7 +121,7 @@ export type SpecialMoveState = {
 export type MatchState = {
   id: string;
   /** Bumped whenever the shape of this blob changes incompatibly. */
-  schema: 8;
+  schema: 9;
   mode: Mode;
   version: number;
   createdAt: number;
@@ -127,6 +134,7 @@ export type MatchState = {
   turnOrder: Side[];
   winner: Team | null;
   players: Record<Side, PlayerState | null>;
+  spectators: SpectatorState[];
   events: MatchEvent[];
   eventSeq: number;
   chat: ChatMessage[];
@@ -155,7 +163,7 @@ export function createMatch(
 ): MatchState {
   return {
     id,
-    schema: 8,
+    schema: 9,
     mode,
     version: 0,
     createdAt: now,
@@ -166,6 +174,7 @@ export function createMatch(
     turnOrder: [],
     winner: null,
     players: { a: null, b: null, c: null, d: null },
+    spectators: [],
     events: [],
     eventSeq: 0,
     chat: [],
@@ -230,6 +239,14 @@ export function cleanName(name: unknown, side: Side): string {
     .trim()
     .slice(0, 18);
   return safe || `Commander ${side.toUpperCase()}`;
+}
+
+/** Adds a read-only visitor to the public roster without exposing its token. */
+export function registerSpectator(state: MatchState, token: string, name: unknown, now: number): void {
+  const existing = state.spectators.find((spectator) => spectator.token === token);
+  if (existing) return;
+  state.spectators.push({ token, name: cleanName(name, 'a'), joinedAt: now });
+  touch(state, now);
 }
 
 /* --------------------------------------------------------------- helpers ---- */
@@ -574,7 +591,7 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
     if (destroyable.length < 2) return fail('That opponent has fewer than two ships remaining', 409);
     special.usedBy[kind].push(side);
     player.lastSeen = now;
-    const bombed = randomCells(Math.ceil(CELLS / 2));
+    const bombed = randomCells(Math.ceil(CELLS * 0.3));
     for (const idx of bombed) {
       if (ally.incoming[idx] !== 0) continue;
       const ship = ally.ships.find((candidate) => !candidate.sunk && candidate.cells.includes(idx));
@@ -768,6 +785,8 @@ export type MatchView = {
   yourTeam: Team | null;
   /** Spectators receive public board marks and sunk reveals, but no fleets. */
   spectating: boolean;
+  /** Public names only; spectator tokens never leave the server. */
+  spectators: { name: string; joinedAt: number }[];
   seats: SeatView[];
   turn: Side | null;
   turnStartedAt: number | null;
@@ -844,6 +863,7 @@ export function viewFor(state: MatchState, viewer: Side | null, since = 0): Matc
     you: viewer,
     yourTeam: me?.team ?? null,
     spectating: viewer === null,
+    spectators: state.spectators.map(({ name, joinedAt }) => ({ name, joinedAt })),
     seats: seatsOf(state).map((s) => seatView(state, viewer, s)),
     turn: state.turn,
     turnStartedAt: state.turnStartedAt,

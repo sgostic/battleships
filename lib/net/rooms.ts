@@ -26,7 +26,7 @@ const LOCK_RETRY_MS = 60;
 /** Bumped whenever `MatchState`'s shape changes incompatibly. A room from before
  *  this schema is discarded rather than fed to rules that don't understand it —
  *  it will simply age out of its 3h TTL. */
-const SCHEMA = 8;
+const SCHEMA = 9;
 
 const queueKey = (mode: Mode) => `sb:queue:${mode}`;
 const roomKey = (id: string) => `sb:room:${id}`;
