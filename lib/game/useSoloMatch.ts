@@ -60,7 +60,10 @@ export function useSoloMatch(level: AiLevel = 'Officer', duo = false): MatchAdap
       const pick = aiPick(memory, incoming, level);
       if (pick === null) break;
       const before = state.eventSeq;
-      const res = fireAt(state, botSide, targetSide, pick, Date.now());
+      // Advance bot time past an authoritative cinematic/asteroid lock so the
+      // queued events can replay in order while the shell animates them.
+      const actionNow = Math.max(Date.now(), state.turnStartedAt ?? 0);
+      const res = fireAt(state, botSide, targetSide, pick, actionNow);
       if (!res.ok) break;
       const shot = state.events.find((e) => e.seq === before + 1);
       if (shot?.type === 'shot') {
@@ -71,7 +74,8 @@ export function useSoloMatch(level: AiLevel = 'Officer', duo = false): MatchAdap
 
   const start = useCallback(() => {
     const now = Date.now();
-    const state = createMatch('SOLO', now, duo ? 'duo' : 'duel', { extraShotOnHit: true });
+    const seed = crypto.getRandomValues(new Uint32Array(1))[0];
+    const state = createMatch('SOLO', now, duo ? 'duo' : 'duel', { extraShotOnHit: true }, false, seed);
     join(state, YOU, 'You', now);
     if (duo) {
       join(state, 'b', 'Admiral Vale', now);

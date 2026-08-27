@@ -117,6 +117,9 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const [copied, setCopied] = useState(false);
   const [turnAlert, setTurnAlert] = useState(false);
   const [specialCallout, setSpecialCallout] = useState<{ name: string; action: string } | null>(null);
+  const [spaceCallout, setSpaceCallout] = useState(false);
+  const [asteroidAlert, setAsteroidAlert] = useState<{ target: string; cell: string } | null>(null);
+  const [now, setNow] = useState(0);
   const [specialModal, setSpecialModal] = useState<{ kind: SpecialKind; turnStartedAt: number } | null>(null);
   const previousTurnRef = useRef<Side | null>(null);
   const previousTurnStartedAtRef = useRef<number | null>(null);
@@ -192,6 +195,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
       seat.revealed.forEach((p) => scene.revealSunkSilently(slot, p));
       if (seat.eliminated) scene.markEliminated(slot);
     });
+    scene.setArena(view.arena);
   }, []);
 
   const applySnapshot = useCallback((view: MatchView) => {
@@ -229,6 +233,27 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
         case 'battle':
           pushLog('CMD', 'Battle stations.');
           break;
+        case 'space-transition':
+          setSpaceCallout(true);
+          pushLog('CMD', `ANOMALY DETECTED — ${nameOf(event.trigger)} has one ship left`);
+          if (Date.now() < event.resumeAt) await scene?.playSpaceTransition();
+          else scene?.setArena('space');
+          setSpaceCallout(false);
+          pushLog('CMD', 'SOLAR THEATER ONLINE · asteroid field inbound');
+          break;
+        case 'asteroid': {
+          const targetSlot = slotForSide(view, event.at);
+          const targetName = event.at === you ? 'YOUR GRID' : `${nameOf(event.at).toUpperCase()}'S GRID`;
+          if (targetSlot) {
+            setAsteroidAlert({ target: targetName, cell: cellName(event.idx) });
+            await scene?.playAsteroidImpact({ to: targetSlot, idx: event.idx, hit: event.hit, sunk: event.sunk });
+            setAsteroidAlert(null);
+          }
+          const targetFleet = event.at === you ? 'your fleet' : `${nameOf(event.at)}'s fleet`;
+          if (event.sunk) pushLog('SNK', `Asteroid impact sank ${targetFleet === 'your fleet' ? 'your' : `${nameOf(event.at)}'s`} ${event.sunk.name}`);
+          else pushLog(event.hit ? 'HIT' : 'MIS', `Asteroid impact ${event.hit ? 'hit' : 'missed'} ${targetFleet} at ${cellName(event.idx)}`);
+          break;
+        }
         case 'special-strike':
           {
             await announceSpecial(nameOf(event.by), 'SCORCHED EARTH');
@@ -385,23 +410,24 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const deploying = Boolean(display && yourSeat && !yourSeat.deployed && display.phase !== 'over');
   const battling = display?.phase === 'battle';
   const myTurn = battling && display?.turn === display?.you;
+  const turnUnlocked = Boolean(display && display.turnStartedAt !== null && now >= display.turnStartedAt);
   // `display` intentionally waits for scene animation; use the latest adapter
   // snapshot for actions so a completed opponent move cannot leave a stale button live.
   const authoritativeMyTurn = adapter.view?.phase === 'battle' && adapter.view.turn === adapter.view.you;
   const canUseSpecial = useCallback((kind: SpecialKind) => {
-    if (!display || !authoritativeMyTurn || !display.specials[kind] || !allySeat || allySeat.eliminated) return false;
+    if (!display || !authoritativeMyTurn || !turnUnlocked || !display.specials[kind] || !allySeat || allySeat.eliminated) return false;
     if (kind === 'scorched-earth') return foeSeats.some((foe) => !foe.eliminated && foe.ships.filter((ship) => !ship.sunk).length >= 2);
     if (kind === 'rapid-salvo' || kind === 'allied-bastion') return true;
     return allySeat.ships.some((ship) => !ship.sunk) && foeSeats.some((foe) => !foe.eliminated && foe.ships.some((ship) => !ship.sunk));
-  }, [allySeat, authoritativeMyTurn, display, foeSeats]);
+  }, [allySeat, authoritativeMyTurn, display, foeSeats, turnUnlocked]);
   const openSpecial = useCallback((kind: SpecialKind) => {
     const live = adapterRef.current.view;
     // Recheck in the click handler: the displayed snapshot can be temporarily
     // behind while the previous shell animation is still finishing.
-    if (!live || live.phase !== 'battle' || live.turn !== live.you || !live.specials[kind]) return;
+    if (!live || live.phase !== 'battle' || live.turn !== live.you || (live.turnStartedAt !== null && Date.now() < live.turnStartedAt) || !live.specials[kind]) return;
     setSpecialModal({ kind, turnStartedAt: live.turnStartedAt ?? 0 });
   }, []);
-  const specialModalOpen = Boolean(authoritativeMyTurn && myTurn && display?.turnStartedAt !== null && specialModal?.turnStartedAt === display.turnStartedAt);
+  const specialModalOpen = Boolean(authoritativeMyTurn && myTurn && turnUnlocked && display?.turnStartedAt !== null && specialModal?.turnStartedAt === display.turnStartedAt);
 
   // Online snapshots and the Three.js scene initialize independently. Syncing
   // from the committed display guarantees that a teammate who joins after the
@@ -411,7 +437,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   }, [display, syncSceneRoster]);
 
   useEffect(() => {
-    if (!myTurn || specialModalOpen || adapter.mode !== 'solo' || !display) return;
+    if (!myTurn || !turnUnlocked || specialModalOpen || adapter.mode !== 'solo' || !display) return;
     const turnStartedAt = display.turnStartedAt;
     const timer = window.setTimeout(() => {
       const latest = adapterRef.current.view;
@@ -424,7 +450,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
       if (choice) void adapterRef.current.fire(choice.side, choice.idx);
     }, Math.max(0, (display.turnStartedAt ?? Date.now()) + 20_000 - Date.now()));
     return () => window.clearTimeout(timer);
-  }, [adapter.mode, display, myTurn, specialModalOpen]);
+  }, [adapter.mode, display, myTurn, specialModalOpen, turnUnlocked]);
   useEffect(() => {
     const currentTurn = display?.phase === 'battle' ? display.turn : null;
     const turnStartedAt = display?.phase === 'battle' ? display.turnStartedAt : null;
@@ -433,18 +459,17 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     );
     previousTurnRef.current = currentTurn;
     previousTurnStartedAtRef.current = turnStartedAt;
-    if (!becameMyTurn) return;
+    if (!becameMyTurn || !turnUnlocked) return;
     setTurnAlert(true);
     const timer = window.setTimeout(() => setTurnAlert(false), 1800);
     return () => window.clearTimeout(timer);
-  }, [display?.phase, display?.turn, display?.turnStartedAt, display?.you]);
-  const [now, setNow] = useState(0);
+  }, [display?.phase, display?.turn, display?.turnStartedAt, display?.you, turnUnlocked]);
   useEffect(() => {
     if (!myTurn) return;
     const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
   }, [myTurn]);
-  const shotSeconds = myTurn && display?.turnStartedAt !== null
+  const shotSeconds = myTurn && turnUnlocked && display?.turnStartedAt !== null
     ? Math.max(0, Math.ceil((display!.turnStartedAt! + 20_000 - now) / 1000))
     : null;
 
@@ -470,12 +495,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     scene.setPhase(phase, interactive);
 
     if (deploying) scene.setPickable(['you']);
-    else if (myTurn && !specialModalOpen) scene.setPickable(livingFoeSlots);
+    else if (myTurn && turnUnlocked && !specialModalOpen && !spaceCallout) scene.setPickable(livingFoeSlots);
     else scene.setPickable([]);
 
     const actingSlot = display.phase === 'battle' && display.turn ? slotForSide(display, display.turn) : null;
     scene.setActingSlot(actingSlot);
-  }, [display, busy, deploying, myTurn, livingFoeSlots, specialModalOpen]);
+  }, [display, busy, deploying, myTurn, turnUnlocked, livingFoeSlots, specialModalOpen, spaceCallout]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -627,7 +652,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
   const phaseLabel = (() => {
     if (!display) return 'LINK UP';
-    if (display.phase === 'battle') return 'PHASE II';
+    if (display.phase === 'battle') return display.arena === 'space' ? 'SOLAR THEATER' : 'PHASE II';
     if (display.phase === 'over') return 'ENGAGEMENT CLOSED';
     return 'PHASE I';
   })();
@@ -704,6 +729,29 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
         </div>
       ) : null}
 
+      {spaceCallout ? (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-[radial-gradient(circle_at_center,rgba(34,167,214,.12),rgba(4,10,22,.58))]">
+          <div className="w-[min(92vw,620px)] animate-sb-special-callout border-y border-foam/80 bg-[rgba(3,18,31,.88)] px-5 py-7 text-center shadow-[0_0_110px_rgba(94,231,255,.45)] sm:px-12 sm:py-9">
+            <p className="stencil mb-3 text-[9px] tracking-[0.28em] text-foam">ANOMALY DETECTED</p>
+            <p className="font-display text-4xl font-bold tracking-[0.18em] text-parchment sm:text-6xl">SPACE CRISIS</p>
+            <p className="mt-4 font-mono text-[10px] tracking-[0.18em] text-foam/80">TRACTOR BEAM · FLEETS LIFTING · HOLD POSITION</p>
+          </div>
+        </div>
+      ) : null}
+
+      {asteroidAlert ? (
+        <div className="pointer-events-none absolute top-[108px] left-1/2 z-40 -translate-x-1/2 animate-sb-rise">
+          <div className="flex min-w-[min(88vw,390px)] items-center gap-4 border-y border-[#ff9a55] bg-[rgba(36,8,5,.91)] px-5 py-3 shadow-[0_0_55px_rgba(255,72,24,.48)] backdrop-blur-md">
+            <span className="grid size-10 shrink-0 place-items-center rounded-full border border-[#ffb071] font-display text-2xl text-[#ffb071] shadow-[inset_0_0_18px_rgba(255,84,28,.35)]" aria-hidden="true">◆</span>
+            <div className="flex-1">
+              <p className="stencil text-[9px] tracking-[0.25em] text-[#ff9a55]">INCOMING ASTEROID</p>
+              <p className="mt-1 font-mono text-[11px] tracking-[0.16em] text-parchment">{asteroidAlert.target} · IMPACT {asteroidAlert.cell}</p>
+            </div>
+            <span className="font-mono text-[10px] tracking-[0.12em] text-[#ffb071]">LOCKED</span>
+          </div>
+        </div>
+      ) : null}
+
       {bastionNotice ? (
         <div className="pointer-events-none absolute top-[112px] left-1/2 z-20 -translate-x-1/2 animate-sb-rise">
           <div className="flex items-center gap-3 border border-foam/70 bg-[rgba(7,35,44,.9)] px-4 py-2.5 shadow-[0_0_30px_rgba(200,244,242,.2)] backdrop-blur-md sm:px-5">
@@ -732,6 +780,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
           onLeave={onLeave}
           turnChips={turnChips}
           shotSeconds={shotSeconds}
+          arena={display?.arena ?? 'sea'}
+          spaceRound={display?.spaceRound ?? null}
         />
 
         {display ? (

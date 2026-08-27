@@ -1,6 +1,6 @@
 'use client';
 
-import type { Side, Team } from '@/lib/game/match';
+import type { Arena, Side, Team } from '@/lib/game/match';
 import { Btn } from './Btn';
 
 export type TurnChip = {
@@ -52,6 +52,8 @@ export type TopBarProps = {
   onLeave?: () => void;
   turnChips?: TurnChip[];
   shotSeconds?: number | null;
+  arena?: Arena;
+  spaceRound?: { completed: Side[]; required: Side[] } | null;
 };
 
 export function TopBar({
@@ -67,6 +69,8 @@ export function TopBar({
   onLeave,
   turnChips = [],
   shotSeconds = null,
+  arena = 'sea',
+  spaceRound = null,
 }: TopBarProps) {
   return (
     <header className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-4 bg-gradient-to-b from-[rgba(6,18,24,.62)] to-transparent px-5 pt-4 pb-6">
@@ -75,8 +79,11 @@ export function TopBar({
           SEA BATTLE
         </h1>
         <p className="stencil mt-1.5 text-brass/85">
-          {roomCode ? `Room ${roomCode}` : 'Naval theater · Golden hour'}
+          {arena === 'space' ? 'Solar theater · Orbital combat' : roomCode ? `Room ${roomCode}` : 'Naval theater · Golden hour'}
         </p>
+        {arena === 'space' && spaceRound ? (
+          <p className="stencil mt-1 text-foam/75">Asteroid {spaceRound.completed.length}/{spaceRound.required.length}</p>
+        ) : null}
         {opponent ? (
           <p className="stencil mt-1 text-parchment/40">VS {opponent}</p>
         ) : null}

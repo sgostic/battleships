@@ -32,6 +32,7 @@ export type SlotSpec = {
 export type BoardHit = { slot: Slot; idx: number };
 
 export type ScenePhase = 'deploy' | 'battle' | 'over';
+export type SceneArena = 'sea' | 'space';
 
 export type GhostSpec = {
   key: ShipKey;
@@ -60,6 +61,17 @@ type ShipVisual = {
   placement: Placement | null;
   sunk: boolean;
   floating: boolean;
+  spaceFx: SpaceRig;
+};
+
+type SpaceRig = {
+  root: THREE.Group;
+  portWing: THREE.Group;
+  starboardWing: THREE.Group;
+  engines: THREE.Mesh[];
+  panels: THREE.Mesh[];
+  core: THREE.Mesh;
+  progress: number;
 };
 
 type AnimSpec = { o: THREE.Object3D; k: 'spin' | 'sweep'; s: number; ph?: number };
@@ -79,6 +91,7 @@ type BoardRig = {
   plateMat: THREE.MeshBasicMaterial;
   basePos: THREE.Vector3;
   phase: number;
+  spaceLift: number;
 };
 
 type Pose = { x: number; z: number; yaw: number };
@@ -127,7 +140,7 @@ type Field = {
 
 type Tween = { t: number; d: number; fn: (u: number) => void; done?: () => void };
 
-type Sfx = 'cannon' | 'whistle' | 'splash' | 'boom' | 'sink' | 'gull' | 'click';
+type Sfx = 'cannon' | 'whistle' | 'splash' | 'boom' | 'sink' | 'gull' | 'click' | 'alert';
 
 const HORIZON_HEX = '#f1b477';
 
@@ -139,6 +152,7 @@ export class SeaBattleScene {
   private renderer!: THREE.WebGLRenderer;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
+  private seaFog!: THREE.Fog;
   private sunDir!: THREE.Vector3;
   private clock = new THREE.Clock();
   private raf = 0;
@@ -155,6 +169,18 @@ export class SeaBattleScene {
   private materials: Record<string, THREE.MeshStandardMaterial> = {};
   private ocean!: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private sky!: THREE.Mesh;
+  private spaceRoot!: THREE.Group;
+  private spaceStars!: THREE.Points;
+  private spaceSun!: THREE.Mesh;
+  private sunCorona!: THREE.Sprite;
+  private sunFlares!: THREE.Group;
+  private ufo!: THREE.Group;
+  private ufoRotor!: THREE.Group;
+  private ufoLightRing!: THREE.Group;
+  private ufoDome!: THREE.Mesh;
+  private ufoScanBeam!: THREE.Mesh;
+  private tractorBeams: THREE.Mesh[] = [];
+  private arena: SceneArena = 'sea';
   private boards = new Map<Slot, BoardRig>();
   private visuals = new Map<Slot, Map<ShipKey, ShipVisual>>();
   private slotMeta = new Map<Slot, SlotSpec>();
@@ -207,6 +233,11 @@ export class SeaBattleScene {
   private muted = true;
   private ac: AudioContext | null = null;
   private master: GainNode | null = null;
+  private ambienceGain: GainNode | null = null;
+  private spaceMusicGain: GainNode | null = null;
+  private spaceMusicTimer: ReturnType<typeof setInterval> | null = null;
+  private spaceMusicStep = 0;
+  private solarAudioActive = false;
   private noiseBuf: AudioBuffer | null = null;
   private gullTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -236,6 +267,7 @@ export class SeaBattleScene {
     this.makeTextures();
     this.buildSky();
     this.buildOcean();
+    this.buildSpaceBackdrop();
     this.buildFields();
     this.ensureBoard('you');
     this.ensureBoard('foeA');
@@ -269,7 +301,8 @@ export class SeaBattleScene {
     this.renderer = renderer;
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(new THREE.Color(HORIZON_HEX), 60, 300);
+    this.seaFog = new THREE.Fog(new THREE.Color(HORIZON_HEX), 60, 300);
+    this.scene.fog = this.seaFog;
     this.camera = new THREE.PerspectiveCamera(46, 1, 0.1, 1200);
     this.sunDir = new THREE.Vector3().setFromSphericalCoords(
       1,
@@ -360,6 +393,7 @@ export class SeaBattleScene {
     this.resizeObserver?.disconnect();
     window.removeEventListener('keydown', this.onKeyDown);
     if (this.gullTimer) clearInterval(this.gullTimer);
+    if (this.spaceMusicTimer) clearInterval(this.spaceMusicTimer);
     this.scene.traverse((o) => {
       const mesh = o as THREE.Mesh;
       mesh.geometry?.dispose();
@@ -721,6 +755,167 @@ export class SeaBattleScene {
     );
   }
 
+  /** Procedural solar arena and the one-shot UFO prop; hidden until Space Crisis. */
+  private buildSpaceBackdrop(): void {
+    this.spaceRoot = new THREE.Group();
+    this.spaceRoot.visible = false;
+    this.scene.add(this.spaceRoot);
+
+    const starPositions: number[] = [];
+    for (let i = 0; i < 900; i++) {
+      const r = 150 + Math.random() * 360;
+      const a = Math.random() * Math.PI * 2;
+      const y = -20 + Math.random() * 220;
+      starPositions.push(Math.cos(a) * r, y, Math.sin(a) * r);
+    }
+    const starGeo = new THREE.BufferGeometry();
+    starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+    this.spaceStars = new THREE.Points(
+      starGeo,
+      new THREE.PointsMaterial({ color: 0xb8e9ff, size: 0.7, transparent: true, opacity: 0.9, sizeAttenuation: true }),
+    );
+    this.spaceRoot.add(this.spaceStars);
+
+    const sunMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 } },
+      vertexShader: [
+        'varying vec3 vPos;',
+        'varying vec3 vNormal;',
+        'void main() {',
+        '  vPos = normalize(position);',
+        '  vNormal = normalize(normalMatrix * normal);',
+        '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+        '}',
+      ].join('\n'),
+      fragmentShader: [
+        'uniform float uTime;',
+        'varying vec3 vPos;',
+        'varying vec3 vNormal;',
+        'float bands(vec3 p) {',
+        '  float a = sin(p.x * 17.0 + sin(p.y * 11.0 + uTime * 0.34) * 2.2);',
+        '  float b = sin(p.y * 29.0 - uTime * 0.72 + sin(p.z * 14.0) * 2.8);',
+        '  float c = sin((p.x + p.z) * 47.0 + uTime * 1.15);',
+        '  return a * 0.28 + b * 0.24 + c * 0.11;',
+        '}',
+        'void main() {',
+        '  float flow = bands(vPos);',
+        '  float cells = sin((vPos.x * vPos.y + vPos.z) * 82.0 + uTime * 0.5) * 0.12;',
+        '  float heat = clamp(0.58 + flow + cells, 0.0, 1.0);',
+        '  vec3 red = vec3(0.72, 0.055, 0.008);',
+        '  vec3 amber = vec3(1.0, 0.30, 0.015);',
+        '  vec3 whiteHot = vec3(1.0, 0.88, 0.48);',
+        '  vec3 col = mix(red, amber, smoothstep(0.05, 0.58, heat));',
+        '  col = mix(col, whiteHot, smoothstep(0.62, 1.0, heat));',
+        '  float limb = pow(max(vNormal.z, 0.0), 0.28);',
+        '  col *= 0.72 + limb * 0.72;',
+        '  gl_FragColor = vec4(col, 1.0);',
+        '}',
+      ].join('\n'),
+    });
+    this.spaceSun = new THREE.Mesh(new THREE.SphereGeometry(17, 64, 48), sunMat);
+    this.spaceSun.position.set(0, 18, -92);
+    this.spaceRoot.add(this.spaceSun);
+
+    this.sunCorona = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: this.tex.soft,
+      color: 0xff8b32,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }));
+    this.sunCorona.position.copy(this.spaceSun.position);
+    this.sunCorona.position.z += 1;
+    this.sunCorona.scale.set(58, 58, 1);
+    this.spaceRoot.add(this.sunCorona);
+
+    this.sunFlares = new THREE.Group();
+    this.sunFlares.position.copy(this.spaceSun.position);
+    const flareMat = new THREE.MeshBasicMaterial({
+      color: 0xffb34d,
+      transparent: true,
+      opacity: 0.42,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    for (let i = 0; i < 5; i++) {
+      const flare = new THREE.Mesh(new THREE.TorusGeometry(18.5 + i * 0.8, 0.16 + i * 0.035, 8, 52, Math.PI * (0.44 + i * 0.05)), flareMat.clone());
+      flare.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+      this.sunFlares.add(flare);
+    }
+    this.spaceRoot.add(this.sunFlares);
+
+    const sunLight = new THREE.PointLight(0xff8a45, 7.5, 290, 1.25);
+    sunLight.position.copy(this.spaceSun.position);
+    this.spaceRoot.add(sunLight);
+
+    this.ufo = new THREE.Group();
+    this.ufo.visible = false;
+    this.ufoRotor = new THREE.Group();
+    const alienMetal = new THREE.MeshStandardMaterial({ color: 0x182a36, metalness: 0.94, roughness: 0.18, emissive: 0x092c3d, emissiveIntensity: 1.3 });
+    const alienEdge = new THREE.MeshStandardMaterial({ color: 0x496774, metalness: 0.9, roughness: 0.14, emissive: 0x0d6c82, emissiveIntensity: 1.1 });
+    const hull = new THREE.Mesh(new THREE.CylinderGeometry(2.75, 4.45, 0.68, 48), alienMetal);
+    const upperDeck = new THREE.Mesh(new THREE.CylinderGeometry(2.15, 3.1, 0.42, 48), alienEdge);
+    upperDeck.position.y = 0.48;
+    const lowerDeck = new THREE.Mesh(new THREE.CylinderGeometry(3.25, 2.2, 0.46, 48), alienMetal);
+    lowerDeck.position.y = -0.52;
+    this.ufoRotor.add(hull, upperDeck, lowerDeck);
+    for (let i = 0; i < 12; i++) {
+      const strut = new THREE.Mesh(new THREE.BoxGeometry(2.05, 0.09, 0.16), alienEdge);
+      strut.position.set(Math.cos(i * Math.PI / 6) * 2.7, -0.16, Math.sin(i * Math.PI / 6) * 2.7);
+      strut.rotation.y = -i * Math.PI / 6;
+      this.ufoRotor.add(strut);
+    }
+    this.ufo.add(this.ufoRotor);
+
+    this.ufoDome = new THREE.Mesh(
+      new THREE.SphereGeometry(1.58, 32, 18, 0, Math.PI * 2, 0, Math.PI / 2),
+      new THREE.MeshPhysicalMaterial({ color: 0x8beaff, emissive: 0x38d9ff, emissiveIntensity: 3.4, transmission: 0.18, roughness: 0.08, metalness: 0.12, transparent: true, opacity: 0.84 }),
+    );
+    this.ufoDome.position.y = 0.68;
+    this.ufo.add(this.ufoDome);
+
+    this.ufoLightRing = new THREE.Group();
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(3.84, 0.09, 8, 64),
+      new THREE.MeshBasicMaterial({ color: 0x74efff, transparent: true, opacity: 0.86, blending: THREE.AdditiveBlending }),
+    );
+    ring.rotation.x = Math.PI / 2;
+    this.ufoLightRing.add(ring);
+    for (let i = 0; i < 20; i++) {
+      const light = new THREE.Mesh(
+        new THREE.SphereGeometry(0.105, 8, 6),
+        new THREE.MeshBasicMaterial({ color: i % 3 === 0 ? 0xffffff : 0x54ddff }),
+      );
+      light.position.set(Math.cos(i * Math.PI / 10) * 3.83, -0.05, Math.sin(i * Math.PI / 10) * 3.83);
+      this.ufoLightRing.add(light);
+    }
+    this.ufo.add(this.ufoLightRing);
+
+    const core = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.66, 1.38, 0.34, 32),
+      new THREE.MeshBasicMaterial({ color: 0xb9f8ff, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending }),
+    );
+    core.position.y = -0.82;
+    this.ufo.add(core);
+
+    const beamMat = new THREE.MeshBasicMaterial({ color: 0x8cf4ff, transparent: true, opacity: 0.2, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending });
+    this.ufoScanBeam = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 2.7, 15, 24, 1, true), beamMat.clone());
+    this.ufoScanBeam.position.y = -8.1;
+    this.ufoScanBeam.visible = false;
+    this.ufo.add(this.ufoScanBeam);
+    const beamPositions: [number, number][] = [[-6.6, 7], [6.6, 7], [-6.6, -7], [6.6, -7]];
+    beamPositions.forEach(([x, z]) => {
+      const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.52, 2.85, 19, 32, 1, true), beamMat.clone());
+      beam.position.set(x, -9, z);
+      beam.scale.y = 0.001;
+      this.tractorBeams.push(beam);
+      this.ufo.add(beam);
+    });
+    this.ufo.position.set(0, 25, 0);
+    this.scene.add(this.ufo);
+  }
+
   /* ---------------------------------------------------------------- boards ---- */
 
   private mat(name: string): THREE.MeshStandardMaterial {
@@ -1076,6 +1271,7 @@ export class SeaBattleScene {
       plateMat,
       basePos,
       phase: Math.random() * 6.28,
+      spaceLift: 0,
     };
   }
 
@@ -1572,12 +1768,147 @@ export class SeaBattleScene {
     return { group: G, anim, baseY };
   }
 
+  /** A compact hard-surface flight kit that unfolds around the recognizable naval hull. */
+  private buildSpaceRig(key: ShipKey, len: number): SpaceRig {
+    const root = new THREE.Group();
+    root.visible = false;
+
+    const armor = new THREE.MeshStandardMaterial({
+      color: key === 'carrier' ? 0x617987 : 0x324a58,
+      metalness: 0.92,
+      roughness: 0.22,
+      emissive: 0x082b3a,
+      emissiveIntensity: 0.75,
+    });
+    const edge = new THREE.MeshStandardMaterial({
+      color: 0x8aa4ad,
+      metalness: 0.86,
+      roughness: 0.2,
+      emissive: 0x0d5369,
+      emissiveIntensity: 1.15,
+    });
+    const solar = new THREE.MeshStandardMaterial({
+      color: 0x173e68,
+      metalness: 0.72,
+      roughness: 0.18,
+      emissive: 0x095184,
+      emissiveIntensity: 1.65,
+    });
+    const energy = new THREE.MeshBasicMaterial({
+      color: 0x75ecff,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+
+    const spine = new THREE.Mesh(new THREE.BoxGeometry(len * 0.62, 0.16, 0.23), armor);
+    spine.position.set(-len * 0.02, 0.34, 0);
+    root.add(spine);
+    for (let i = -1; i <= 1; i++) {
+      const rib = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.22, 0.74), edge);
+      rib.position.set(i * len * 0.2, 0.3, 0);
+      root.add(rib);
+    }
+
+    const cockpit = new THREE.Mesh(
+      new THREE.SphereGeometry(Math.max(0.14, len * 0.065), 16, 9),
+      new THREE.MeshPhysicalMaterial({ color: 0x4fbdde, emissive: 0x1d9bc7, emissiveIntensity: 2.2, metalness: 0.35, roughness: 0.08, transparent: true, opacity: 0.82 }),
+    );
+    cockpit.scale.set(1.55, 0.62, 0.82);
+    cockpit.position.set(len * 0.18, 0.48, 0);
+    root.add(cockpit);
+
+    const portWing = new THREE.Group();
+    const starboardWing = new THREE.Group();
+    portWing.position.set(0, 0.28, 0.08);
+    starboardWing.position.set(0, 0.28, -0.08);
+    root.add(portWing, starboardWing);
+    const panels: THREE.Mesh[] = [];
+    const wingSpan = key === 'carrier' ? 0.52 : key === 'battleship' ? 0.38 : key === 'submarine' ? 0.26 : 0.32;
+    const wingLength = key === 'destroyer' ? len * 0.5 : len * 0.64;
+    ([portWing, starboardWing] as const).forEach((wing, sideIndex) => {
+      const sign = sideIndex === 0 ? 1 : -1;
+      const spar = new THREE.Mesh(new THREE.BoxGeometry(wingLength, 0.06, wingSpan), armor);
+      spar.position.set(-len * 0.05, 0, sign * wingSpan * 0.48);
+      wing.add(spar);
+      for (let i = 0; i < 3; i++) {
+        const panel = new THREE.Mesh(new THREE.BoxGeometry(wingLength * 0.27, 0.025, wingSpan * 0.76), solar);
+        panel.position.set(-wingLength * 0.29 + i * wingLength * 0.29, 0.045, sign * wingSpan * 0.5);
+        wing.add(panel);
+        panels.push(panel);
+      }
+      const tip = new THREE.Mesh(new THREE.BoxGeometry(wingLength * 0.74, 0.09, 0.1), edge);
+      tip.position.set(-len * 0.05, 0.03, sign * wingSpan * 0.94);
+      wing.add(tip);
+    });
+
+    const engines: THREE.Mesh[] = [];
+    const engineCount = key === 'carrier' || key === 'battleship' ? 4 : 2;
+    for (let i = 0; i < engineCount; i++) {
+      const lane = i - (engineCount - 1) / 2;
+      const z = lane * (engineCount === 4 ? 0.16 : 0.28);
+      const nacelle = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.2, 0.52, 14), armor);
+      nacelle.rotation.z = Math.PI / 2;
+      nacelle.position.set(-len * 0.43, 0.25, z);
+      root.add(nacelle);
+      const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.16, 0.08, 16), energy.clone());
+      nozzle.rotation.z = Math.PI / 2;
+      nozzle.position.set(-len * 0.69, 0.25, z);
+      root.add(nozzle);
+      engines.push(nozzle);
+    }
+
+    if (key === 'submarine') {
+      const ionRing = new THREE.Mesh(new THREE.TorusGeometry(0.48, 0.065, 8, 24), energy.clone());
+      ionRing.rotation.y = Math.PI / 2;
+      ionRing.position.set(-len * 0.08, 0.32, 0);
+      root.add(ionRing);
+      engines.push(ionRing);
+    } else if (key === 'carrier') {
+      const commandDeck = new THREE.Mesh(new THREE.BoxGeometry(len * 0.38, 0.12, 0.5), edge);
+      commandDeck.position.set(len * 0.06, 0.52, 0);
+      root.add(commandDeck);
+    } else if (key === 'battleship') {
+      const dorsal = new THREE.Mesh(new THREE.ConeGeometry(0.26, 0.82, 4), armor);
+      dorsal.rotation.z = -Math.PI / 2;
+      dorsal.position.set(len * 0.3, 0.45, 0);
+      root.add(dorsal);
+    }
+
+    const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 1), energy.clone());
+    core.position.set(-len * 0.02, 0.53, 0);
+    root.add(core);
+    const rig = { root, portWing, starboardWing, engines, panels, core, progress: 0 };
+    this.setSpaceRigProgress(rig, 0);
+    return rig;
+  }
+
+  private setSpaceRigProgress(rig: SpaceRig, progress: number): void {
+    const p = Math.max(0, Math.min(1, progress));
+    const eased = p * p * (3 - 2 * p);
+    rig.progress = p;
+    rig.root.visible = p > 0.001;
+    rig.root.scale.setScalar(0.22 + eased * 0.78);
+    rig.portWing.rotation.x = (1 - eased) * 1.42;
+    rig.starboardWing.rotation.x = -(1 - eased) * 1.42;
+    rig.panels.forEach((panel) => { panel.scale.z = 0.08 + eased * 0.92; });
+    rig.engines.forEach((engine) => {
+      engine.scale.setScalar(0.3 + eased * 0.7);
+      const mat = engine.material as THREE.MeshBasicMaterial;
+      if (mat.transparent) mat.opacity = 0.18 + eased * 0.77;
+    });
+    rig.core.scale.setScalar(0.35 + eased * 0.65);
+  }
+
   private buildFleetMeshesFor(slot: Slot, rig: BoardRig): void {
     const visuals = this.visuals.get(slot)!;
     SHIP_DEFS.forEach((def) => {
       const { group, anim, baseY } = this.shipMesh(def.key);
       group.visible = false;
       rig.ships.add(group);
+      const spaceFx = this.buildSpaceRig(def.key, def.len);
+      group.add(spaceFx.root);
       visuals.set(def.key, {
         key: def.key,
         mesh: group,
@@ -1587,6 +1918,7 @@ export class SeaBattleScene {
         placement: null,
         sunk: false,
         floating: false,
+        spaceFx,
       });
     });
   }
@@ -2169,7 +2501,218 @@ export class SeaBattleScene {
     im.computeBoundingSphere();
   }
 
+  private spaceImpact(pos: THREE.Vector3, hit: boolean): void {
+    const color = hit ? 0x7cecff : 0x8fb8ff;
+    this.glow(pos.clone().setY(pos.y + 0.22), color, hit ? 1.5 : 0.8, hit ? 7 : 4, 0.55, 0.9);
+    this.ring(pos.clone().setY(pos.y + 0.05), color, hit ? 0.36 : 0.22, hit ? 4.6 : 2.8, 0.7, 0.9);
+    this.shake(hit ? 0.35 : 0.12);
+    this.sfx(hit ? 'boom' : 'whistle');
+  }
+
   /* ------------------------------------------------------------ public API ---- */
+
+  setArena(arena: SceneArena, immediate = true): void {
+    this.arena = arena;
+    const inSpace = arena === 'space';
+    this.solarAudioActive = inSpace;
+    this.syncArenaAudio();
+    this.ocean.visible = !inSpace;
+    this.sky.visible = !inSpace;
+    this.scene.fog = inSpace ? null : this.seaFog;
+    this.spaceRoot.visible = inSpace;
+    this.clouds.forEach(({ sp }) => { sp.visible = !inSpace; });
+    this.gulls.forEach(({ grp }) => { grp.visible = !inSpace; });
+    if (immediate) {
+      this.visuals.forEach((ships) => ships.forEach((visual) => {
+        this.setSpaceRigProgress(visual.spaceFx, inSpace ? 1 : 0);
+      }));
+    }
+    if (!inSpace) {
+      this.boards.forEach((board) => { board.spaceLift = 0; });
+      this.ufo.visible = false;
+    }
+    if (immediate) this.wake(inSpace ? 1200 : 300);
+  }
+
+  async playSpaceTransition(): Promise<void> {
+    if (this.arena === 'space' || this.disposed) return;
+    this.interactive = false;
+    this.setPickable([]);
+    this.solarAudioActive = true;
+    this.syncArenaAudio(1.5);
+    this.ufo.visible = true;
+    this.ufo.position.set(-38, 27, -24);
+    this.ufo.rotation.set(-0.22, -0.8, -0.56);
+    this.ufo.scale.setScalar(0.28);
+    this.ufoScanBeam.visible = false;
+    this.visuals.forEach((ships) => ships.forEach((visual) => this.setSpaceRigProgress(visual.spaceFx, 0)));
+    this.tractorBeams.forEach((beam) => { beam.scale.y = 0.001; });
+    this.sfx('boom');
+    await this.twAsync((u) => {
+      const e = 1 - Math.pow(1 - u, 3);
+      this.ufo.position.set(-38 + e * 38, 27 - e * 13.5 + Math.sin(u * Math.PI) * 3.5, -24 + e * 24);
+      this.ufo.rotation.set(-0.22 * (1 - e), -0.8 + e * 2.4, -0.56 * (1 - e));
+      this.ufo.scale.setScalar(0.28 + e * 0.72);
+      this.ufoRotor.rotation.y = u * Math.PI * 7;
+      this.ufoLightRing.rotation.y = -u * Math.PI * 11;
+    }, 1.85);
+
+    this.ufoScanBeam.visible = true;
+    await this.twAsync((u) => {
+      const pulse = Math.sin(u * Math.PI);
+      this.ufo.position.y = 13.5 + Math.sin(u * Math.PI * 4) * 0.18;
+      this.ufoScanBeam.position.x = -7.5 + u * 15;
+      this.ufoScanBeam.position.z = Math.sin(u * Math.PI * 2) * 5.5;
+      this.ufoScanBeam.rotation.z = Math.sin(u * Math.PI * 2) * 0.16;
+      this.ufoScanBeam.scale.set(0.65 + pulse * 0.35, 0.78 + pulse * 0.18, 0.65 + pulse * 0.35);
+      (this.ufoScanBeam.material as THREE.MeshBasicMaterial).opacity = 0.08 + pulse * 0.32;
+    }, 1.25);
+    this.ufoScanBeam.visible = false;
+
+    await this.twAsync((u) => {
+      const lift = u * u * (3 - 2 * u);
+      this.boards.forEach((board) => { board.spaceLift = lift * 5.5; });
+      this.tractorBeams.forEach((beam, i) => {
+        const beamProgress = Math.max(0, Math.min(1, u * 1.55 - i * 0.16));
+        beam.scale.y = 0.001 + beamProgress * 0.999;
+        (beam.material as THREE.MeshBasicMaterial).opacity = 0.08 + beamProgress * 0.24;
+      });
+      this.visuals.forEach((ships, slot) => {
+        const order = Math.max(0, ALL_SLOTS.indexOf(slot));
+        const conversion = Math.max(0, Math.min(1, u * 1.52 - order * 0.14));
+        ships.forEach((visual) => this.setSpaceRigProgress(visual.spaceFx, conversion));
+      });
+      this.ufo.position.y = 13.5 - lift * 2.2;
+      this.ufo.rotation.y += 0.012;
+    }, 2.65);
+
+    this.glow(new THREE.Vector3(0, 4, 0), 0xc9f8ff, 8, 42, 0.95, 0.72);
+    this.setArena('space', false);
+    await this.twAsync((u) => {
+      const settle = 1 - Math.pow(1 - u, 3);
+      this.boards.forEach((board) => { board.spaceLift = (1 - settle) * 5.5; });
+      this.tractorBeams.forEach((beam) => {
+        beam.scale.y = Math.max(0.001, 1 - settle);
+        (beam.material as THREE.MeshBasicMaterial).opacity = (1 - settle) * 0.28;
+      });
+      this.ufo.position.set(u * 5, 11.3 + u * 25, -u * 48);
+      this.ufo.rotation.x = -u * 0.44;
+      this.ufo.rotation.z = u * 0.34;
+      this.ufo.scale.setScalar(Math.max(0.08, 1 - u * 0.74));
+    }, 2.15);
+    this.ufo.visible = false;
+    this.ufo.scale.setScalar(1);
+    this.ufo.rotation.set(0, 0, 0);
+    this.ufoScanBeam.visible = false;
+    this.tractorBeams.forEach((beam) => { beam.scale.y = 0.001; });
+    this.visuals.forEach((ships) => ships.forEach((visual) => this.setSpaceRigProgress(visual.spaceFx, 1)));
+    this.wake(1200);
+  }
+
+  async playAsteroidImpact(opts: { to: Slot; idx: number; hit: boolean; sunk: Placement | null }): Promise<void> {
+    if (this.arena !== 'space' || this.disposed) return;
+    const dst = this.worldCell(opts.to, opts.idx);
+    const start = new THREE.Vector3(dst.x - 27, dst.y + 15, dst.z - 34);
+    const impact = dst.clone().add(new THREE.Vector3(0, 0.2, 0));
+    const backward = start.clone().sub(impact).normalize();
+
+    const rockMat = new THREE.MeshStandardMaterial({ color: 0x765044, roughness: 0.94, metalness: 0.08, emissive: 0x7b1e0b, emissiveIntensity: 0.45 });
+    const rock = new THREE.Group();
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.86, 2), rockMat);
+    core.scale.set(1.18, 0.82, 1);
+    rock.add(core);
+    for (let i = 0; i < 5; i++) {
+      const shard = new THREE.Mesh(new THREE.IcosahedronGeometry(0.22 + i * 0.035, 1), rockMat);
+      shard.position.set(Math.sin(i * 2.2) * 0.72, Math.cos(i * 1.7) * 0.48, Math.sin(i * 3.1) * 0.62);
+      shard.scale.set(1, 0.65, 0.82);
+      rock.add(shard);
+    }
+    rock.position.copy(start);
+
+    const tail = new THREE.Mesh(
+      new THREE.ConeGeometry(0.72, 4.6, 18, 1, true),
+      new THREE.MeshBasicMaterial({ color: 0xff7638, transparent: true, opacity: 0.72, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }),
+    );
+    tail.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), backward);
+    tail.position.copy(start).addScaledVector(backward, 2.1);
+
+    const heat = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.soft, color: 0xff5f28, transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending }));
+    heat.position.copy(start);
+    heat.scale.set(3.4, 3.4, 1);
+
+    const pathGeometry = new THREE.BufferGeometry().setFromPoints([start, impact]);
+    const pathMaterial = new THREE.LineDashedMaterial({ color: 0xff7647, dashSize: 0.72, gapSize: 0.42, transparent: true, opacity: 0.82, depthWrite: false });
+    const path = new THREE.Line(pathGeometry, pathMaterial);
+    path.computeLineDistances();
+
+    const target = new THREE.Group();
+    target.position.copy(impact);
+    const targetMaterial = new THREE.MeshBasicMaterial({ color: 0xff6738, transparent: true, opacity: 0.9, depthWrite: false, blending: THREE.AdditiveBlending });
+    const targetGeometry = new THREE.TorusGeometry(0.68, 0.055, 8, 32);
+    [0.75, 1.25].forEach((scale) => {
+      const reticle = new THREE.Mesh(targetGeometry, targetMaterial);
+      reticle.rotation.x = Math.PI / 2;
+      reticle.scale.setScalar(scale);
+      target.add(reticle);
+    });
+    const crossA = new THREE.Mesh(new THREE.BoxGeometry(2.15, 0.025, 0.035), targetMaterial);
+    const crossB = crossA.clone();
+    crossB.rotation.y = Math.PI / 2;
+    target.add(crossA, crossB);
+
+    this.scene.add(path, target, tail, heat, rock);
+    this.sfx('alert');
+    await this.twAsync((u) => {
+      const pulse = 0.82 + Math.sin(u * Math.PI * 6) * 0.18;
+      target.scale.setScalar(pulse);
+      target.rotation.y = u * Math.PI * 1.5;
+      rock.scale.setScalar(0.86 + u * 0.22);
+      heat.scale.setScalar(2.7 + pulse * 0.8);
+      pathMaterial.opacity = 0.45 + pulse * 0.4;
+    }, 0.9);
+
+    this.sfx('whistle');
+    await this.twAsync((u) => {
+      const flight = u * u * (3 - 2 * u);
+      const p = new THREE.Vector3().lerpVectors(start, impact, flight);
+      p.y += Math.sin(u * Math.PI) * 1.8;
+      rock.position.copy(p);
+      rock.rotation.x = u * 10;
+      rock.rotation.z = u * 7;
+      tail.position.copy(p).addScaledVector(backward, 2.1);
+      heat.position.copy(p).addScaledVector(backward, 0.35);
+      const flare = 1 + Math.sin(u * Math.PI * 14) * 0.12;
+      tail.scale.set(flare, 0.75 + u * 0.55, flare);
+      heat.scale.setScalar((3.5 + u * 2.2) * flare);
+      rockMat.emissiveIntensity = 0.6 + u * 3.2;
+      pathMaterial.opacity = (1 - u) * 0.78;
+      target.scale.setScalar(0.9 + Math.sin(u * Math.PI * 10) * 0.16);
+      target.rotation.y += 0.08;
+    }, 1.8);
+    this.scene.remove(rock, tail, heat, path, target);
+    rock.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      mesh.geometry?.dispose();
+    });
+    rockMat.dispose();
+    tail.geometry.dispose();
+    (tail.material as THREE.Material).dispose();
+    (heat.material as THREE.Material).dispose();
+    pathGeometry.dispose();
+    pathMaterial.dispose();
+    targetGeometry.dispose();
+    crossA.geometry.dispose();
+    targetMaterial.dispose();
+    if (this.arena === 'space') this.spaceImpact(dst, opts.hit);
+    else if (opts.hit) this.boom(dst.clone().add(new THREE.Vector3(0, 0.24, 0)));
+    else this.splash(dst.clone());
+    this.addPeg(opts.to, opts.idx, opts.hit);
+    if (opts.sunk) {
+      if (this.slotMeta.get(opts.to)?.fogged) this.placeShip(opts.to, opts.sunk, true);
+      this.sinkShip(opts.to, opts.sunk);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, opts.hit ? 520 : 320));
+  }
 
   setPhase(phase: ScenePhase, interactive: boolean): void {
     this.phase = phase;
@@ -2392,7 +2935,9 @@ export class SeaBattleScene {
     });
     if (this.disposed) return;
 
-    if (hit) {
+    if (this.arena === 'space') {
+      this.spaceImpact(dst, hit);
+    } else if (hit) {
       const p = dst.clone();
       p.y += 0.2;
       this.boom(p);
@@ -2427,7 +2972,8 @@ export class SeaBattleScene {
       await this.shellArc(src.clone(), dst, { apex: 3.4, dur: 0.085 });
       if (this.disposed) return;
       const hit = opts.marks[idx] === 2;
-      if (hit) this.boom(dst.clone().add(new THREE.Vector3(0, 0.2, 0)));
+      if (this.arena === 'space') this.spaceImpact(dst, hit);
+      else if (hit) this.boom(dst.clone().add(new THREE.Vector3(0, 0.2, 0)));
       else this.splash(dst.clone());
       this.addPeg(opts.to, idx, hit);
       await new Promise<void>((resolve) => setTimeout(resolve, 18));
@@ -2534,6 +3080,7 @@ export class SeaBattleScene {
 
   /** Wipes every board for a rematch. */
   reset(): void {
+    this.setArena('sea');
     this.boards.forEach((b, slot) => {
       b.pegW.count = 0;
       b.pegR.count = 0;
@@ -2547,6 +3094,7 @@ export class SeaBattleScene {
         v.placement = null;
         v.sunk = false;
         v.floating = false;
+        this.setSpaceRigProgress(v.spaceFx, 0);
       });
       const spec = this.slotMeta.get(slot);
       if (spec && spec.eliminated) {
@@ -2694,6 +3242,63 @@ export class SeaBattleScene {
     } else if (this.ac && this.master) {
       this.master.gain.linearRampToValueAtTime(0, this.ac.currentTime + 0.2);
     }
+    this.syncArenaAudio();
+  }
+
+  private syncArenaAudio(fade = 0.8): void {
+    if (!this.ac || !this.ambienceGain || !this.spaceMusicGain) return;
+    const now = this.ac.currentTime;
+    const solar = this.solarAudioActive;
+    this.ambienceGain.gain.cancelScheduledValues(now);
+    this.ambienceGain.gain.setValueAtTime(this.ambienceGain.gain.value, now);
+    this.ambienceGain.gain.linearRampToValueAtTime(solar ? 0.055 : 0.5, now + fade);
+    this.spaceMusicGain.gain.cancelScheduledValues(now);
+    this.spaceMusicGain.gain.setValueAtTime(this.spaceMusicGain.gain.value, now);
+    this.spaceMusicGain.gain.linearRampToValueAtTime(solar ? 0.24 : 0, now + fade);
+  }
+
+  private playSpaceMusicNote(): void {
+    if (!this.ac || !this.spaceMusicGain || this.muted || !this.solarAudioActive) return;
+    const ac = this.ac;
+    const now = ac.currentTime;
+    const scale = [220, 261.63, 329.63, 392, 523.25, 440, 329.63, 293.66];
+    const frequency = scale[this.spaceMusicStep++ % scale.length];
+    const envelope = ac.createGain();
+    envelope.gain.setValueAtTime(0.0001, now);
+    envelope.gain.exponentialRampToValueAtTime(0.075, now + 0.08);
+    envelope.gain.exponentialRampToValueAtTime(0.0001, now + 1.45);
+    const filter = ac.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(frequency * 2.4, now);
+    filter.frequency.exponentialRampToValueAtTime(frequency * 0.9, now + 1.2);
+    filter.Q.value = 2.8;
+    const pan = ac.createStereoPanner();
+    pan.pan.value = Math.sin(this.spaceMusicStep * 1.8) * 0.56;
+    envelope.connect(filter);
+    filter.connect(pan);
+    pan.connect(this.spaceMusicGain);
+
+    const delay = ac.createDelay(1.5);
+    delay.delayTime.value = 0.39;
+    const feedback = ac.createGain();
+    feedback.gain.value = 0.28;
+    pan.connect(delay);
+    delay.connect(feedback);
+    feedback.connect(delay);
+    delay.connect(this.spaceMusicGain);
+
+    ([{ type: 'sine' as const, detune: -7, gain: 1 }, { type: 'triangle' as const, detune: 9, gain: 0.34 }]).forEach((voice) => {
+      const oscillator = ac.createOscillator();
+      const voiceGain = ac.createGain();
+      oscillator.type = voice.type;
+      oscillator.frequency.value = frequency;
+      oscillator.detune.value = voice.detune;
+      voiceGain.gain.value = voice.gain;
+      oscillator.connect(voiceGain);
+      voiceGain.connect(envelope);
+      oscillator.start(now);
+      oscillator.stop(now + 1.55);
+    });
   }
 
   private audio(): AudioContext | null {
@@ -2725,11 +3330,42 @@ export class SeaBattleScene {
       src.connect(lp);
       lp.connect(gg);
       gg.connect(this.master);
+      this.ambienceGain = gg;
       src.start();
       this.noiseBuf = buf;
+
+      this.spaceMusicGain = this.ac.createGain();
+      this.spaceMusicGain.gain.value = 0;
+      this.spaceMusicGain.connect(this.master);
+      const droneFilter = this.ac.createBiquadFilter();
+      droneFilter.type = 'lowpass';
+      droneFilter.frequency.value = 720;
+      droneFilter.Q.value = 4.2;
+      droneFilter.connect(this.spaceMusicGain);
+      [55, 82.41, 110].forEach((frequency, i) => {
+        const oscillator = this.ac!.createOscillator();
+        const voiceGain = this.ac!.createGain();
+        oscillator.type = i === 1 ? 'triangle' : 'sine';
+        oscillator.frequency.value = frequency;
+        oscillator.detune.value = i === 0 ? -9 : i === 2 ? 7 : 0;
+        voiceGain.gain.value = i === 1 ? 0.075 : 0.052;
+        oscillator.connect(voiceGain);
+        voiceGain.connect(droneFilter);
+        oscillator.start();
+      });
+      const lfo = this.ac.createOscillator();
+      const lfoDepth = this.ac.createGain();
+      lfo.frequency.value = 0.075;
+      lfoDepth.gain.value = 260;
+      lfo.connect(lfoDepth);
+      lfoDepth.connect(droneFilter.frequency);
+      lfo.start();
+      this.spaceMusicTimer = setInterval(() => this.playSpaceMusicNote(), 760);
+
       this.gullTimer = setInterval(() => {
         if (!this.muted && Math.random() < 0.5) this.sfx('gull');
       }, 7000);
+      this.syncArenaAudio(0.1);
     }
     if (this.ac.state === 'suspended') void this.ac.resume();
     return this.ac;
@@ -2809,6 +3445,21 @@ export class SeaBattleScene {
       });
     } else if (kind === 'click') {
       tone(880, 620, 0.07, 0.06, 'square');
+    } else if (kind === 'alert') {
+      [0, 0.24, 0.48].forEach((delay, i) => {
+        const oscillator = ac.createOscillator();
+        const gain = ac.createGain();
+        oscillator.type = 'square';
+        oscillator.frequency.setValueAtTime(i === 2 ? 740 : 520, t + delay);
+        oscillator.frequency.exponentialRampToValueAtTime(i === 2 ? 980 : 690, t + delay + 0.13);
+        gain.gain.setValueAtTime(0.0008, t + delay);
+        gain.gain.exponentialRampToValueAtTime(0.075, t + delay + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.0008, t + delay + 0.17);
+        oscillator.connect(gain);
+        gain.connect(out);
+        oscillator.start(t + delay);
+        oscillator.stop(t + delay + 0.19);
+      });
     }
   }
 
@@ -2836,6 +3487,29 @@ export class SeaBattleScene {
     this.updField(this.fieldAdd, dt);
     this.updField(this.fieldNorm, dt);
 
+    if (this.arena === 'space') {
+      this.spaceStars.rotation.y = t * 0.004;
+      (this.spaceSun.material as THREE.ShaderMaterial).uniforms.uTime.value = t;
+      this.spaceSun.rotation.y = t * 0.012;
+      this.spaceSun.rotation.z = Math.sin(t * 0.05) * 0.08;
+      this.spaceSun.scale.setScalar(1 + Math.sin(t * 1.7) * 0.006);
+      const coronaPulse = 1 + Math.sin(t * 0.72) * 0.035 + Math.sin(t * 2.1) * 0.012;
+      this.sunCorona.scale.set(58 * coronaPulse, 58 * coronaPulse, 1);
+      (this.sunCorona.material as THREE.SpriteMaterial).opacity = 0.64 + Math.sin(t * 1.13) * 0.07;
+      this.sunFlares.rotation.z = t * 0.018;
+      this.sunFlares.children.forEach((flare, i) => {
+        flare.rotation.z += dt * (0.035 + i * 0.008) * (i % 2 ? -1 : 1);
+        flare.scale.setScalar(0.96 + Math.sin(t * (0.42 + i * 0.07) + i) * 0.055);
+      });
+    }
+
+    if (this.ufo.visible) {
+      this.ufoRotor.rotation.y += dt * 4.8;
+      this.ufoLightRing.rotation.y -= dt * 7.6;
+      const domeMat = this.ufoDome.material as THREE.MeshPhysicalMaterial;
+      domeMat.emissiveIntensity = 2.8 + Math.sin(t * 5.2) * 0.85;
+    }
+
     this.boards.forEach((b, slot) => {
       if (!b.grp.visible) return;
       const meta = this.slotMeta.get(slot);
@@ -2844,14 +3518,29 @@ export class SeaBattleScene {
       this.visuals.get(slot)?.forEach((v) => {
         if (!v.mesh.visible || v.sunk) return;
         const wp = v.mesh.getWorldPosition(this.scratchWorld);
-        const h = this.waveH(wp.x, wp.z, t) * 0.34;
+        const h = this.arena === 'space'
+          ? Math.sin(t * 0.82 + v.bobPhase) * 0.065
+          : this.waveH(wp.x, wp.z, t) * 0.34;
         v.mesh.position.y = v.baseY + h + (v.floating ? 0.16 : 0);
-        v.mesh.rotation.z = Math.sin(t * 0.75 + v.bobPhase) * 0.028;
-        v.mesh.rotation.x = Math.sin(t * 0.55 + v.bobPhase * 1.7) * 0.02;
+        v.mesh.rotation.z = Math.sin(t * (this.arena === 'space' ? 0.42 : 0.75) + v.bobPhase) * (this.arena === 'space' ? 0.014 : 0.028);
+        v.mesh.rotation.x = Math.sin(t * (this.arena === 'space' ? 0.34 : 0.55) + v.bobPhase * 1.7) * (this.arena === 'space' ? 0.012 : 0.02);
         v.anim.forEach((a) => {
           if (a.k === 'spin') a.o.rotation.y = t * a.s;
           else a.o.rotation.y = Math.sin(t * a.s + (a.ph ?? 0)) * 0.55;
         });
+        if (this.arena === 'space') {
+          v.spaceFx.root.visible = true;
+          v.spaceFx.root.position.y = Math.sin(t * 1.1 + v.bobPhase) * 0.018;
+          v.spaceFx.engines.forEach((engine, i) => {
+            const pulse = 0.88 + Math.sin(t * 8.5 + i * 1.7 + v.bobPhase) * 0.12;
+            engine.scale.setScalar(pulse);
+            const mat = engine.material as THREE.MeshBasicMaterial;
+            if (mat.transparent) mat.opacity = 0.74 + pulse * 0.2;
+          });
+          const corePulse = 0.86 + Math.sin(t * 4.6 + v.bobPhase) * 0.14;
+          v.spaceFx.core.scale.setScalar(corePulse);
+          v.spaceFx.core.rotation.y = t * 1.9;
+        }
       });
 
       const show = this.interactive && this.hover?.slot === slot;
@@ -2870,7 +3559,9 @@ export class SeaBattleScene {
         mat.opacity = 0.34 + 0.06 * Math.sin(t * 0.4);
         b.blanket.position.y = 0.4 + 0.04 * Math.sin(t * 0.5);
       }
-      b.grp.position.y = b.basePos.y + this.waveH(b.grp.position.x, 0, t) * 0.1;
+      b.grp.position.y = this.arena === 'space'
+        ? b.basePos.y + 0.76 + b.spaceLift + Math.sin(t * 0.45 + b.phase) * 0.14
+        : b.basePos.y + b.spaceLift + this.waveH(b.grp.position.x, 0, t) * 0.1;
       b.grp.rotation.z = Math.sin(t * 0.4 + b.phase) * 0.006;
 
       // Billboard the nameplate toward the camera, compensating for the board's yaw.

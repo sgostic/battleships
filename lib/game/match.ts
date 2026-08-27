@@ -35,6 +35,7 @@ export const TEAMS: readonly Team[] = ['red', 'blue'];
 export const TEAM_SIZE: Record<Mode, number> = { duel: 1, duo: 2 };
 
 export type Phase = 'lobby' | 'deploy' | 'battle' | 'over';
+export type Arena = 'sea' | 'space';
 
 /** 0 = never fired at, 1 = miss, 2 = hit. */
 export type Mark = 0 | 1 | 2;
@@ -97,6 +98,8 @@ export type MatchEvent =
   | { seq: number; type: 'special-mark'; by: Side; ally: Side; allySunk: SunkReveal; target: Side; idx: number; sunk: SunkReveal | null }
   | { seq: number; type: 'special-salvo'; by: Side; ally: Side; shots: number; skips: number }
   | { seq: number; type: 'special-bastion'; by: Side; ally: Side; turns: number }
+  | { seq: number; type: 'space-transition'; trigger: Side; resumeAt: number }
+  | { seq: number; type: 'asteroid'; at: Side; idx: number; hit: boolean; sunk: SunkReveal | null; next: Side | null; resumeAt: number }
   | { seq: number; type: 'skipped'; side: Side; remaining: number }
   | { seq: number; type: 'over'; winner: Team }
   | { seq: number; type: 'left'; side: Side }
@@ -121,14 +124,15 @@ export type SpecialMoveState = {
 export type MatchState = {
   id: string;
   /** Bumped whenever the shape of this blob changes incompatibly. */
-  schema: 9;
+  schema: 10;
   mode: Mode;
   version: number;
   createdAt: number;
   updatedAt: number;
   phase: Phase;
+  arena: Arena;
   turn: Side | null;
-  /** Epoch time when the current turn began, used by the online shot clock. */
+  /** Epoch time when the current turn becomes actionable, used by the shot clock. */
   turnStartedAt: number | null;
   /** Frozen the moment the battle starts; elimination skips seats, never reorders. */
   turnOrder: Side[];
@@ -140,12 +144,24 @@ export type MatchState = {
   chat: ChatMessage[];
   rules: MatchRules;
   specialMove: SpecialMoveState | null;
+  /** Internal Space Crisis state. Eligibility and RNG never leave the server. */
+  spaceCrisis: {
+    rolled: boolean;
+    eligible: boolean;
+    active: boolean;
+    trigger: Side | null;
+    completed: Side[];
+  } | null;
+  rngState: number;
   /** Listed in the quick-match queue. */
   open: boolean;
 };
 
 /** Events older than this are dropped; a lagging client resyncs from the snapshot. */
 const EVENT_HISTORY = 160;
+const SPACE_CRISIS_CHANCE = 0.25;
+const SPACE_TRANSITION_MS = 8_000;
+const ASTEROID_RESOLUTION_MS = 3_000;
 
 export type Fail = { ok: false; error: string; code: number };
 export type Done<T = undefined> = { ok: true; value: T };
@@ -160,15 +176,17 @@ export function createMatch(
   mode: Mode,
   rules: Partial<MatchRules> = {},
   open = false,
+  seed = hashSeed(`${id}:${now}`),
 ): MatchState {
   return {
     id,
-    schema: 9,
+    schema: 10,
     mode,
     version: 0,
     createdAt: now,
     updatedAt: now,
     phase: 'lobby',
+    arena: 'sea',
     turn: null,
     turnStartedAt: null,
     turnOrder: [],
@@ -183,6 +201,8 @@ export function createMatch(
       lobbyReady: rules.lobbyReady ?? mode === 'duo',
     },
     specialMove: mode === 'duo' ? newSpecialMoveState() : null,
+    spaceCrisis: mode === 'duo' ? newSpaceCrisisState() : null,
+    rngState: seed >>> 0 || 0x6d2b79f5,
     open,
   };
 }
@@ -212,6 +232,21 @@ function emit(state: MatchState, event: Unsequenced<MatchEvent>): void {
 function touch(state: MatchState, now: number): void {
   state.version += 1;
   state.updatedAt = now;
+}
+
+function hashSeed(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) h = Math.imul(h ^ input.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
+function randomUnit(state: MatchState): number {
+  let x = state.rngState >>> 0;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  state.rngState = x >>> 0;
+  return state.rngState / 0x1_0000_0000;
 }
 
 function newPlayer(token: string, name: string, now: number, team: Team | null): PlayerState {
@@ -342,17 +377,142 @@ function startTurn(state: MatchState, side: Side | null, now: number): void {
   }
 }
 
+function actionLocked(state: MatchState, now: number): Fail | null {
+  if (state.turnStartedAt !== null && now < state.turnStartedAt) {
+    return fail('The theater is in transition', 409);
+  }
+  return null;
+}
+
+function oneShipSides(state: MatchState): Side[] {
+  return seatsOf(state).filter((side) => {
+    const player = state.players[side];
+    return Boolean(player && !player.eliminated && player.ships?.filter((ship) => !ship.sunk).length === 1);
+  });
+}
+
+function prepareSpaceCrisis(state: MatchState): void {
+  const crisis = state.spaceCrisis;
+  if (!crisis || crisis.rolled) return;
+  crisis.rolled = true;
+  crisis.eligible = randomUnit(state) < SPACE_CRISIS_CHANCE;
+  crisis.active = false;
+  crisis.trigger = null;
+  crisis.completed = [];
+  state.arena = 'sea';
+}
+
+/** Activates once, after a damage action changes a seat to exactly one living ship. */
+function maybeActivateSpace(state: MatchState, now: number, before: readonly Side[]): boolean {
+  const crisis = state.spaceCrisis;
+  if (state.phase !== 'battle' || !crisis?.rolled || !crisis.eligible || crisis.active) return false;
+  const newlyCritical = oneShipSides(state).filter((side) => !before.includes(side));
+  if (!newlyCritical.length) return false;
+  const trigger = state.turnOrder.find((side) => newlyCritical.includes(side)) ?? newlyCritical[0];
+  activateSpace(state, now, trigger);
+  return true;
+}
+
+function activateSpace(state: MatchState, now: number, trigger: Side): void {
+  const crisis = state.spaceCrisis;
+  if (!crisis || crisis.active) return;
+  crisis.active = true;
+  crisis.trigger = trigger;
+  crisis.completed = [];
+  state.arena = 'space';
+  const resumeAt = now + SPACE_TRANSITION_MS;
+  if (state.turn) state.turnStartedAt = resumeAt;
+  emit(state, { type: 'space-transition', trigger, resumeAt });
+}
+
+function emitOverIfNeeded(state: MatchState): void {
+  if (state.phase === 'over' && state.winner && state.events[state.events.length - 1]?.type !== 'over') {
+    emit(state, { type: 'over', winner: state.winner });
+  }
+}
+
+function resolveAsteroid(state: MatchState, now: number): void {
+  const crisis = state.spaceCrisis;
+  if (state.phase !== 'battle' || !crisis?.active) return;
+  const living = seatsOf(state).filter((side) => {
+    const player = state.players[side];
+    return Boolean(player && !player.eliminated && player.ships && player.incoming.some((mark) => mark === 0));
+  });
+  if (!living.length) return;
+  const at = living[Math.floor(randomUnit(state) * living.length)];
+  const target = state.players[at]!;
+  const cells = target.incoming.flatMap((mark, idx) => (mark === 0 ? [idx] : []));
+  const idx = cells[Math.floor(randomUnit(state) * cells.length)];
+  const ship = target.ships!.find((candidate) => !candidate.sunk && candidate.cells.includes(idx));
+  const hit = Boolean(ship);
+  target.incoming[idx] = hit ? 2 : 1;
+  let sunk: SunkReveal | null = null;
+  if (ship) {
+    ship.hits += 1;
+    if (ship.hits >= ship.cells.length) {
+      ship.sunk = true;
+      sunk = sunkReveal(ship);
+    }
+  }
+  if (target.ships!.every((shipState) => shipState.sunk) && !target.eliminated) {
+    target.eliminated = true;
+  }
+
+  let next = state.turn;
+  if (target.eliminated && next === at) {
+    next = advanceTurn(state, at);
+    startTurn(state, next, now);
+  }
+  const foeTeam = target.team as Team;
+  if (livingOn(state, foeTeam).length === 0) {
+    state.phase = 'over';
+    state.turn = null;
+    state.turnStartedAt = null;
+    state.winner = TEAMS.find((team) => team !== foeTeam && livingOn(state, team).length > 0) ?? null;
+    next = null;
+  }
+
+  const resumeAt = now + ASTEROID_RESOLUTION_MS;
+  if (state.turn) state.turnStartedAt = resumeAt;
+  emit(state, { type: 'asteroid', at, idx, hit, sunk, next, resumeAt });
+  if (target.eliminated) emit(state, { type: 'eliminated', side: at });
+  crisis.completed = [];
+}
+
+function noteCompletedTurn(state: MatchState, side: Side, now: number): void {
+  const crisis = state.spaceCrisis;
+  if (state.phase !== 'battle' || !crisis) return;
+  if (!crisis.active) return;
+  const player = state.players[side];
+  if (player && !player.eliminated && !crisis.completed.includes(side)) crisis.completed.push(side);
+  const required = seatsOf(state).filter((candidate) => {
+    const p = state.players[candidate];
+    return Boolean(p && !p.eliminated);
+  });
+  if (required.length && required.every((candidate) => crisis.completed.includes(candidate))) {
+    resolveAsteroid(state, now);
+  }
+}
+
 function sunkReveal(ship: ShipState): SunkReveal {
   return { key: ship.key, orient: ship.orient, cells: ship.cells, name: defFor(ship.key)?.name ?? ship.key };
 }
 
-function randomCells(count: number): number[] {
+function randomCells(state: MatchState, count: number): number[] {
   const cells = Array.from({ length: CELLS }, (_, idx) => idx);
   for (let i = 0; i < count; i++) {
-    const j = i + Math.floor(Math.random() * (cells.length - i));
+    const j = i + Math.floor(randomUnit(state) * (cells.length - i));
     [cells[i], cells[j]] = [cells[j], cells[i]];
   }
   return cells.slice(0, count);
+}
+
+function shuffle<T>(state: MatchState, values: T[]): T[] {
+  for (let i = values.length - 1; i > 0; i--) {
+    const j = Math.floor(randomUnit(state) * (i + 1));
+    [values[i], values[j]] = [values[j], values[i]];
+  }
+  return values;
 }
 
 function newSpecialMoveState(): SpecialMoveState {
@@ -362,6 +522,10 @@ function newSpecialMoveState(): SpecialMoveState {
     allySkips: null,
     bastion: null,
   };
+}
+
+function newSpaceCrisisState(): NonNullable<MatchState['spaceCrisis']> {
+  return { rolled: false, eligible: false, active: false, trigger: null, completed: [] };
 }
 
 function canStart(state: MatchState): boolean {
@@ -454,6 +618,7 @@ export function deploy(state: MatchState, side: Side, fleet: unknown, now: numbe
 
   const seats = seatsOf(state);
   if (seats.every((s) => state.players[s]?.ships)) {
+    prepareSpaceCrisis(state);
     state.turnOrder = buildTurnOrder(state);
     state.phase = 'battle';
     startTurn(state, state.turnOrder[0] ?? null, now);
@@ -469,6 +634,9 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   if (!shooter) return fail('You are not seated in this match', 403);
   if (state.phase !== 'battle') return fail('No battle in progress', 409);
   if (state.turn !== side) return fail('Not your turn', 409);
+  const locked = actionLocked(state, now);
+  if (locked) return locked;
+  const oneBefore = oneShipSides(state);
 
   const seats = seatsOf(state);
   if (typeof targetRaw !== 'string' || !(seats as string[]).includes(targetRaw)) {
@@ -542,7 +710,9 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   }
 
   emit(state, { type: 'shot', by: side, at: targetSide, idx, hit, sunk, next });
-  if (state.phase === 'over') emit(state, { type: 'over', winner: state.winner as Team });
+  const spaceActivated = maybeActivateSpace(state, now, oneBefore);
+  if (!spaceActivated && state.phase === 'battle' && next !== side) noteCompletedTurn(state, side, now);
+  emitOverIfNeeded(state);
   touch(state, now);
   return done(undefined);
 }
@@ -554,6 +724,9 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
   if (!player) return fail('You are not seated in this match', 403);
   if (state.phase !== 'battle' || state.mode !== 'duo') return fail('No special strike is available', 409);
   if (state.turn !== side) return fail('Not your turn', 409);
+  const locked = actionLocked(state, now);
+  if (locked) return locked;
+  const oneBefore = oneShipSides(state);
   if (!special || !SPECIAL_KINDS.includes(kindRaw as SpecialKind)) return fail('Unknown tactical action', 422);
   const kind = kindRaw as SpecialKind;
   if (special.usedBy[kind].includes(side)) return fail('You have already spent this tactical action', 409);
@@ -576,6 +749,7 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
     player.lastSeen = now;
     emit(state, { type: 'special-bastion', by: side, ally: allySide, turns: 4 });
     startTurn(state, advanceTurn(state, side), now);
+    noteCompletedTurn(state, side, now);
     touch(state, now);
     return done(undefined);
   }
@@ -591,7 +765,7 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
     if (destroyable.length < 2) return fail('That opponent has fewer than two ships remaining', 409);
     special.usedBy[kind].push(side);
     player.lastSeen = now;
-    const bombed = randomCells(Math.ceil(CELLS * 0.3));
+    const bombed = randomCells(state, Math.ceil(CELLS * 0.3));
     for (const idx of bombed) {
       if (ally.incoming[idx] !== 0) continue;
       const ship = ally.ships.find((candidate) => !candidate.sunk && candidate.cells.includes(idx));
@@ -599,7 +773,7 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
       if (ship) ship.hits += 1;
     }
     ally.ships.filter((ship) => !ship.sunk && ship.hits >= ship.cells.length).forEach((ship) => { ship.sunk = true; });
-    const destroyed = destroyable.sort(() => Math.random() - 0.5).slice(0, 2).map((ship) => {
+    const destroyed = shuffle(state, destroyable.slice()).slice(0, 2).map((ship) => {
       ship.sunk = true; ship.hits = ship.cells.length;
       ship.cells.forEach((idx) => { target.incoming[idx] = 2; });
       return sunkReveal(ship);
@@ -613,13 +787,13 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
       const enemy = state.players[candidate];
       return Boolean(enemy && enemy.team !== player.team && !enemy.eliminated && enemy.ships?.some((ship) => !ship.sunk));
     });
-    const targetSide = enemySides[Math.floor(Math.random() * enemySides.length)];
+    const targetSide = enemySides[Math.floor(randomUnit(state) * enemySides.length)];
     const target = targetSide ? state.players[targetSide] : null;
     if (!target || !target.ships) return fail('No enemy ship can be marked', 409);
     const targetShips = target.ships.filter((ship) => !ship.sunk);
-    const targetShip = targetShips[Math.floor(Math.random() * targetShips.length)];
+    const targetShip = targetShips[Math.floor(randomUnit(state) * targetShips.length)];
     const idx = targetShip.cells.find((cell) => target.incoming[cell] === 0) ?? targetShip.cells[0];
-    const allyShip = allyTargets[Math.floor(Math.random() * allyTargets.length)];
+    const allyShip = allyTargets[Math.floor(randomUnit(state) * allyTargets.length)];
     special.usedBy[kind].push(side);
     player.lastSeen = now; player.shotsFired += 1; player.hitsLanded += 1;
     target.incoming[idx] = 2; targetShip.hits += 1;
@@ -640,12 +814,15 @@ export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknow
     // Taking the strike is the commander's whole turn; declining is not.
     startTurn(state, advanceTurn(state, side), now);
   }
+  const spaceActivated = maybeActivateSpace(state, now, oneBefore);
+  if (!spaceActivated && state.phase === 'battle') noteCompletedTurn(state, side, now);
+  emitOverIfNeeded(state);
   touch(state, now);
   return done(undefined);
 }
 
 export function autoFire(state: MatchState, side: Side, now: number): Result<{ target: Side; idx: number }> {
-  if (state.turnStartedAt === null || now - state.turnStartedAt < 20_000) return fail('The shot clock has not expired', 409);
+  if (state.turnStartedAt === null || now < state.turnStartedAt || now - state.turnStartedAt < 20_000) return fail('The shot clock has not expired', 409);
   const protectedSide = state.specialMove?.bastion?.activeEnemy === side ? state.specialMove.bastion.protectedSide : null;
   const choices = seatsOf(state).flatMap((target) => {
     const player = state.players[target];
@@ -653,7 +830,7 @@ export function autoFire(state: MatchState, side: Side, now: number): Result<{ t
     return player.incoming.flatMap((mark, idx) => (mark === 0 ? [{ target, idx }] : []));
   });
   if (!choices.length) return fail('No legal targets remain', 409);
-  const choice = choices[Math.floor(Math.random() * choices.length)];
+  const choice = choices[Math.floor(randomUnit(state) * choices.length)];
   const result = fire(state, side, choice.target, choice.idx, now);
   return result.ok ? done(choice) : result;
 }
@@ -685,10 +862,12 @@ export function requestRematch(
       p.rematch = false;
     });
     state.phase = 'deploy';
+    state.arena = 'sea';
     state.turn = null;
     state.winner = null;
     state.turnOrder = [];
     state.specialMove = state.mode === 'duo' ? newSpecialMoveState() : null;
+    if (state.mode === 'duo') state.spaceCrisis = newSpaceCrisisState();
     emit(state, { type: 'reset' });
   }
   touch(state, now);
@@ -712,6 +891,19 @@ export function leave(state: MatchState, side: Side, now: number): Result {
       state.turn = null;
       state.winner = winner;
       emit(state, { type: 'over', winner });
+    } else {
+      const crisis = state.spaceCrisis;
+      if (crisis?.active) {
+        crisis.completed = crisis.completed.filter((candidate) => state.players[candidate]);
+        const required = seatsOf(state).filter((candidate) => {
+          const p = state.players[candidate];
+          return Boolean(p && !p.eliminated);
+        });
+        if (required.length && required.every((candidate) => crisis.completed.includes(candidate))) {
+          resolveAsteroid(state, now);
+          emitOverIfNeeded(state);
+        }
+      }
     }
   } else if (state.phase === 'deploy') {
     // Committed fleets are kept; everyone re-readies once the room refills.
@@ -774,6 +966,7 @@ export type MatchView = {
   version: number;
   mode: Mode;
   phase: Phase;
+  arena: Arena;
   eventSeq: number;
   rules: MatchRules;
   /** Remaining per-player tactical action charges. */
@@ -793,6 +986,8 @@ export type MatchView = {
   turn: Side | null;
   turnStartedAt: number | null;
   turnOrder: Side[];
+  /** Public only while Space Crisis is active; eligibility and RNG stay hidden. */
+  spaceRound: { completed: Side[]; required: Side[] } | null;
   outcome: 'win' | 'loss' | null;
   events: MatchEvent[];
   chat: ChatMessage[];
@@ -856,6 +1051,7 @@ export function viewFor(state: MatchState, viewer: Side | null, since = 0): Matc
     version: state.version,
     mode: state.mode,
     phase: state.phase,
+    arena: state.arena,
     eventSeq: state.eventSeq,
     rules: state.rules,
     specials: Object.fromEntries(SPECIAL_KINDS.map((kind) => [kind, Boolean(viewer && state.specialMove && !state.specialMove.usedBy[kind].includes(viewer))])) as Record<SpecialKind, boolean>,
@@ -878,6 +1074,12 @@ export function viewFor(state: MatchState, viewer: Side | null, since = 0): Matc
     turn: state.turn,
     turnStartedAt: state.turnStartedAt,
     turnOrder: state.turnOrder,
+    spaceRound: state.spaceCrisis?.active
+      ? {
+          completed: state.spaceCrisis.completed,
+          required: seatsOf(state).filter((side) => Boolean(state.players[side] && !state.players[side]!.eliminated)),
+        }
+      : null,
     outcome: state.winner && me ? (state.winner === me.team ? 'win' : 'loss') : null,
     events: state.events.filter((e) => e.seq > since),
     chat: state.chat ?? [],
