@@ -780,6 +780,8 @@ export type MatchView = {
   specials: Record<SpecialKind, boolean>;
   /** When set, this viewer must target this enemy while Allied Bastion is active. */
   forcedTarget: Side | null;
+  /** Public tactical status so opponents can see who Allied Bastion protects. */
+  bastion: { protectedSide: Side; targetSide: Side; remainingEnemyTurns: number; activeEnemy: Side | null } | null;
   /** Null for a read-only spectator. */
   you: Side | null;
   yourTeam: Team | null;
@@ -859,6 +861,14 @@ export function viewFor(state: MatchState, viewer: Side | null, since = 0): Matc
     specials: Object.fromEntries(SPECIAL_KINDS.map((kind) => [kind, Boolean(viewer && state.specialMove && !state.specialMove.usedBy[kind].includes(viewer))])) as Record<SpecialKind, boolean>,
     forcedTarget: state.specialMove?.bastion?.activeEnemy === viewer
       ? state.specialMove.bastion.allySide
+      : null,
+    bastion: state.specialMove?.bastion
+      ? {
+          protectedSide: state.specialMove.bastion.protectedSide,
+          targetSide: state.specialMove.bastion.allySide,
+          remainingEnemyTurns: state.specialMove.bastion.remainingEnemyTurns,
+          activeEnemy: state.specialMove.bastion.activeEnemy,
+        }
       : null,
     you: viewer,
     yourTeam: me?.team ?? null,

@@ -371,6 +371,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const yourSeat = display?.seats.find((s) => s.relation === 'self') ?? null;
   const allySeat = display?.seats.find((s) => s.relation === 'ally') ?? null;
   const foeSeats = useMemo(() => display?.seats.filter((s) => s.relation === 'foe') ?? [], [display]);
+  const bastionNotice = useMemo(() => {
+    if (!display?.bastion || display.bastion.protectedSide === display.you) return null;
+    const protectedSeat = display.seats.find((seat) => seat.side === display.bastion?.protectedSide);
+    const targetSeat = display.seats.find((seat) => seat.side === display.bastion?.targetSide);
+    return {
+      protectedName: protectedSeat?.name ?? 'Enemy commander',
+      targetName: targetSeat?.name ?? 'their ally',
+      turns: display.bastion.remainingEnemyTurns,
+    };
+  }, [display]);
 
   const deploying = Boolean(display && yourSeat && !yourSeat.deployed && display.phase !== 'over');
   const battling = display?.phase === 'battle';
@@ -686,10 +696,24 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
       {specialCallout ? (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
-          <div className="animate-sb-special-callout border-y border-flare bg-[rgba(78,30,12,.9)] px-10 py-6 text-center shadow-[0_0_90px_rgba(255,103,39,.62)]">
-            <p className="stencil mb-3 text-brass">TACTICAL ACTION DEPLOYED</p>
-            <p className="font-display text-3xl font-bold tracking-[0.18em] text-parchment sm:text-5xl">{specialCallout.action}</p>
-            <p className="mt-3 font-mono text-[11px] tracking-[0.22em] text-flare">{specialCallout.name.toUpperCase()}</p>
+          <div className="w-[min(92vw,560px)] animate-sb-special-callout border-y border-flare bg-[rgba(78,30,12,.9)] px-4 py-5 text-center shadow-[0_0_90px_rgba(255,103,39,.62)] sm:px-10 sm:py-6">
+            <p className="stencil mb-3 text-[8px] tracking-[0.14em] text-brass sm:text-[9px] sm:tracking-[0.22em]">TACTICAL ACTION DEPLOYED</p>
+            <p className="break-words font-display text-2xl font-bold leading-tight tracking-[0.12em] text-parchment sm:text-5xl sm:tracking-[0.18em]">{specialCallout.action}</p>
+            <p className="mt-3 break-words font-mono text-[10px] tracking-[0.14em] text-flare sm:text-[11px] sm:tracking-[0.22em]">{specialCallout.name.toUpperCase()}</p>
+          </div>
+        </div>
+      ) : null}
+
+      {bastionNotice ? (
+        <div className="pointer-events-none absolute top-[112px] left-1/2 z-20 -translate-x-1/2 animate-sb-rise">
+          <div className="flex items-center gap-3 border border-foam/70 bg-[rgba(7,35,44,.9)] px-4 py-2.5 shadow-[0_0_30px_rgba(200,244,242,.2)] backdrop-blur-md sm:px-5">
+            <span className="grid size-8 shrink-0 place-items-center border border-foam/70 text-xl text-foam" aria-hidden="true">◈</span>
+            <div>
+              <p className="stencil text-[8px] tracking-[0.18em] text-foam">ALLIED BASTION · {bastionNotice.turns} TURNS REMAINING</p>
+              <p className="mt-1 font-display text-[13px] tracking-[0.08em] text-parchment sm:text-[15px]">
+                <span className="text-foam">{bastionNotice.protectedName}</span> is shielded — target {bastionNotice.targetName}
+              </p>
+            </div>
           </div>
         </div>
       ) : null}
