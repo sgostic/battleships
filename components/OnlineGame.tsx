@@ -34,25 +34,25 @@ export function OnlineGame({ roomId }: { roomId: string }) {
     const handlePageHide = (event: PageTransitionEvent) => {
       // Keep a page entering the back/forward cache resumable.
       if (event.persisted) return;
-      if (leftRef.current || !match.token) return;
+      if (leftRef.current || !match.token || match.spectating) return;
       leftRef.current = true;
       leaveRoom(roomId, match.token);
     };
 
     window.addEventListener('pagehide', handlePageHide);
     return () => window.removeEventListener('pagehide', handlePageHide);
-  }, [match.token, roomId]);
+  }, [match.token, match.spectating, roomId]);
 
   // Leaving is explicit. A refresh or a dropped connection keeps the seat, so
   // reloading mid-battle resumes instead of forfeiting.
   const leave = useCallback(() => {
-    if (match.token && !leftRef.current) {
+    if (match.token && !leftRef.current && !match.spectating) {
       leftRef.current = true;
       leaveRoom(roomId, match.token);
     }
     forgetSession(roomId);
     router.push('/');
-  }, [match.token, roomId, router]);
+  }, [match.spectating, match.token, roomId, router]);
 
   const submitNickname = useCallback((name: string) => {
     rememberName(name);

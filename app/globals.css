@@ -20,6 +20,7 @@
   --animate-sb-pulse: sb-pulse 1.6s ease-in-out infinite;
   --animate-sb-rise: sb-rise 0.45s ease both;
   --animate-sb-turn-alert: sb-turn-alert 1.8s ease both;
+  --animate-sb-special-callout: sb-special-callout 1.65s ease both;
 }
 
 @keyframes sb-fade {
@@ -59,6 +60,13 @@
   14% { opacity: 1; transform: scale(1); }
   78% { opacity: 1; transform: scale(1); }
   100% { opacity: 0; transform: scale(1.03); }
+}
+
+@keyframes sb-special-callout {
+  0% { opacity: 0; transform: scale(0.82); }
+  16% { opacity: 1; transform: scale(1); }
+  78% { opacity: 1; transform: scale(1.03); }
+  100% { opacity: 0; transform: scale(1.08); }
 }
 
 /* Utility for the recurring stencilled label treatment in the HUD. */

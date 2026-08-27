@@ -9,12 +9,13 @@ import {
   type MatchState,
   type MatchView,
   type Side,
+  type SpecialKind,
   createMatch,
   deploy as deployFleetTo,
   fire as fireAt,
   join,
   requestRematch,
-  respondSpecialMove as respondToSpecialMove,
+  launchSpecialMove,
   setReady,
   setTeam,
   sendChat as sendChatMessage,
@@ -45,15 +46,13 @@ export function useSoloMatch(level: AiLevel = 'Officer', duo = false): MatchAdap
     while (state.phase === 'battle' && state.turn !== YOU_SIDE && guard++ < 480) {
       const botSide = state.turn;
       if (!botSide || !BOT_SIDES.includes(botSide)) break;
-      // Bots always reject the high-risk 2v2 strike in this first iteration.
-      if (state.specialMove?.offerSide === botSide) {
-        const declined = respondToSpecialMove(state, botSide, false, null, Date.now());
-        if (!declined.ok) break;
-      }
       const memory = memoryRef.current[botSide] ?? (memoryRef.current[botSide] = newAiMemory());
+      const forcedTarget = state.specialMove?.bastion?.activeEnemy === botSide
+        ? state.specialMove.bastion.allySide
+        : null;
       const targets = BOT_SIDES.concat(YOU_SIDE).filter((targetSide) => {
         const target = state.players[targetSide];
-        return Boolean(target && target.team !== state.players[botSide]?.team && !target.eliminated);
+        return Boolean(target && (!forcedTarget || targetSide === forcedTarget) && target.team !== state.players[botSide]?.team && !target.eliminated);
       });
       const targetSide = targets[Math.floor(Math.random() * targets.length)];
       const incoming = targetSide ? state.players[targetSide]?.incoming : null;
@@ -134,13 +133,16 @@ export function useSoloMatch(level: AiLevel = 'Officer', duo = false): MatchAdap
     [publish, runOpponent],
   );
 
-  const respondSpecialMove = useCallback(async (accept: boolean, target?: Side) => {
+  const useSpecialMove = useCallback(async (kind: SpecialKind, target?: Side) => {
     const state = stateRef.current;
     if (!state) return;
-    const res = respondToSpecialMove(state, YOU_SIDE, accept, target, Date.now());
+    const res = launchSpecialMove(state, YOU_SIDE, kind, target, Date.now());
     if (!res.ok) setError(res.error);
-    else publish();
-  }, [publish]);
+    else {
+      runOpponent();
+      publish();
+    }
+  }, [publish, runOpponent]);
 
   const rematch = useCallback(async () => {
     const state = stateRef.current;
@@ -170,7 +172,7 @@ export function useSoloMatch(level: AiLevel = 'Officer', duo = false): MatchAdap
     clearError: () => setError(null),
     deploy,
     fire,
-    respondSpecialMove,
+    useSpecialMove,
     rematch,
     sendChat,
   };

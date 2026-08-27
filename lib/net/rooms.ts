@@ -9,8 +9,9 @@ import {
   type Mode,
   createMatch,
   isJoinable,
+  shouldDisposeRoom,
 } from '../game/match';
-import { ROOM_ALPHABET, ROOM_CODE_LENGTH, normalizeRoomId } from './protocol';
+import { ROOM_ALPHABET, ROOM_CODE_LENGTH, SPECTATOR_TOKEN_PREFIX, normalizeRoomId } from './protocol';
 import { getStore } from './store';
 
 export { ROOM_CODE_LENGTH, normalizeRoomId };
@@ -25,7 +26,7 @@ const LOCK_RETRY_MS = 60;
 /** Bumped whenever `MatchState`'s shape changes incompatibly. A room from before
  *  this schema is discarded rather than fed to rules that don't understand it —
  *  it will simply age out of its 3h TTL. */
-const SCHEMA = 4;
+const SCHEMA = 8;
 
 const queueKey = (mode: Mode) => `sb:queue:${mode}`;
 const roomKey = (id: string) => `sb:room:${id}`;
@@ -46,6 +47,10 @@ export function newRoomCode(): string {
 
 export function newPlayerToken(): string {
   return Array.from(randomBytes(24), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function newSpectatorToken(): string {
+  return `${SPECTATOR_TOKEN_PREFIX}${newPlayerToken()}`;
 }
 
 export async function loadRoom(id: string): Promise<MatchState | null> {
@@ -107,7 +112,14 @@ export async function mutateRoom<T>(
     const result = mutate(state);
     if (!result.ok) return result;
 
-    await saveRoom(state);
+    // Dispose within the room lock so a completely abandoned room cannot be
+    // resumed in the gap between its last mutation and deletion.
+    if (shouldDisposeRoom(state)) {
+      await store.del(roomKey(id));
+      await store.lrem(queueKey(state.mode), id);
+    } else {
+      await saveRoom(state);
+    }
     return { ok: true, state, value: result.value };
   } finally {
     await store.release(key, token);

@@ -11,12 +11,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MatchAdapter } from '../game/adapter';
-import type { MatchView, Side, Team } from '../game/match';
+import type { MatchView, Side, SpecialKind, Team } from '../game/match';
 import type { Placement } from '../game/rules';
 import {
   ApiError,
   claimSeat,
   fetchView,
+  forgetSession,
   postDeploy,
   postChat,
   postFire,
@@ -35,6 +36,7 @@ export type OnlineMatch = MatchAdapter & {
   /** Set when the room cannot be entered at all (missing, full, expired). */
   fatal: string | null;
   token: string | null;
+  spectating: boolean;
   retry: () => void;
 };
 
@@ -43,6 +45,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
   const [view, setView] = useState<MatchView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
+  const [spectating, setSpectating] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const versionRef = useRef(-1);
 
@@ -61,6 +64,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
         const session = await claimSeat(roomId, recallName());
         if (cancelled) return;
         setToken(session.token);
+        setSpectating(session.spectating);
         ingest(session.view);
         setError(null);
       } catch (err) {
@@ -99,6 +103,7 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
         } catch (err) {
           if (stopped || controller.signal.aborted) break;
           if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
+            if (err.status === 404) forgetSession(roomId);
             setFatal(err.message);
             break;
           }
@@ -137,24 +142,16 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     (target: Side, idx: number) => guard((t) => postFire(roomId, t, target, idx, 0)),
     [guard, roomId],
   );
-  const respondSpecialMove = useCallback(
-    (accept: boolean, target?: Side) => guard((t) => postSpecialMove(roomId, t, accept, target, 0)),
+  const useSpecialMove = useCallback(
+    (kind: SpecialKind, target?: Side) => guard((t) => postSpecialMove(roomId, t, kind, target, 0)),
     [guard, roomId],
   );
   useEffect(() => {
     if (!view || view.phase !== 'battle' || view.turn !== view.you || view.turnStartedAt === null) return;
-    if (view.specialMoveOffer) {
-      const expiresAt = view.specialMoveExpiresAt ?? Date.now() + 20_000;
-      const timer = window.setTimeout(
-        () => void respondSpecialMove(false),
-        Math.max(0, expiresAt - Date.now() + 100),
-      );
-      return () => window.clearTimeout(timer);
-    }
     // Add a small grace period for clock skew between the browser and server.
     const timer = window.setTimeout(() => void guard((t) => postAutoFire(roomId, t, 0)), Math.max(0, view.turnStartedAt + 12_000 - Date.now() + 500));
     return () => window.clearTimeout(timer);
-  }, [guard, respondSpecialMove, roomId, view]);
+  }, [guard, roomId, view]);
   const setTeam = useCallback(
     (team: Team | null) => guard((t) => postTeam(roomId, t, team, 0)),
     [guard, roomId],
@@ -177,14 +174,16 @@ export function useOnlineMatch(roomId: string): OnlineMatch {
     clearError: () => setError(null),
     deploy,
     fire,
-    respondSpecialMove,
+    useSpecialMove: spectating ? undefined : useSpecialMove,
     setTeam,
     setReady,
     rematch,
-    sendChat,
+    sendChat: spectating ? undefined : sendChat,
+    spectating,
     retry: () => {
       releaseClaim(roomId);
       setFatal(null);
+      setSpectating(false);
       setAttempt((n) => n + 1);
     },
   };

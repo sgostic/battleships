@@ -1,7 +1,8 @@
 import type { NextRequest } from 'next/server';
 import { cleanName, join, sideForToken, viewFor } from '@/lib/game/match';
 import { jsonError, readJson, readToken, requiredName, resolveRoomId } from '@/lib/net/api';
-import { dequeueRoom, mutateRoom, newPlayerToken } from '@/lib/net/rooms';
+import { isSpectatorToken } from '@/lib/net/protocol';
+import { dequeueRoom, mutateRoom, newPlayerToken, newSpectatorToken } from '@/lib/net/rooms';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,9 +19,12 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   const token = existingToken || newPlayerToken();
 
   const outcome = await mutateRoom(roomId, (state) => {
+    if (isSpectatorToken(token)) return { ok: true as const, value: null };
     const already = sideForToken(state, token);
     if (already) return { ok: true as const, value: already };
-    return join(state, token, cleanName(name, state.players.a ? 'b' : 'a'), Date.now());
+    const seated = join(state, token, cleanName(name, state.players.a ? 'b' : 'a'), Date.now());
+    // A shared room link stays useful after all combat seats are claimed.
+    return seated.ok ? seated : seated.code === 409 ? { ok: true as const, value: null } : seated;
   });
 
   if (!outcome.ok) return jsonError(outcome.error, outcome.code);
@@ -28,8 +32,10 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   // A filled room should no longer be offered to quick-match callers.
   if (!outcome.state.open) await dequeueRoom(outcome.state.mode, roomId);
 
+  const spectating = outcome.value === null;
+  const sessionToken = spectating && !isSpectatorToken(token) ? newSpectatorToken() : token;
   return Response.json(
-    { roomId, token, side: outcome.value, view: viewFor(outcome.state, outcome.value) },
+    { roomId, token: sessionToken, side: outcome.value, spectating, view: viewFor(outcome.state, outcome.value) },
     { headers: { 'cache-control': 'no-store' } },
   );
 }

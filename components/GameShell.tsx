@@ -29,10 +29,11 @@ import {
   WaitingOverlay,
 } from '@/components/hud/Overlays';
 import { Chat } from '@/components/hud/Chat';
+import { TacticalActions } from '@/components/hud/TacticalActions';
 import { type TurnChip, TopBar } from '@/components/hud/TopBar';
 import type { MatchAdapter } from '@/lib/game/adapter';
 import { LOG_LIMIT, type LogEntry, type LogTag } from '@/lib/game/log';
-import type { MatchEvent, MatchView, SeatView, Side, Team } from '@/lib/game/match';
+import type { MatchEvent, MatchView, SeatView, Side, SpecialKind, Team } from '@/lib/game/match';
 import { SHIP_DEFS, type Orient, type Placement, type ShipKey, cellName, cellsFor, defFor, randomFleet } from '@/lib/game/rules';
 import {
   type BoardHit,
@@ -58,6 +59,12 @@ type SlotAssignment = { slot: Slot; seat: SeatView };
 
 /** Maps the match's absolute seats onto the theater's viewer-relative slots. */
 function assignSlots(view: MatchView): SlotAssignment[] {
+  // Spectators have no friendly board. Keep every board fogged, but still map
+  // the full battlefield into the fixed scene slots so 2v2 remains watchable.
+  if (view.spectating) {
+    const slots: Slot[] = view.mode === 'duo' ? ['you', 'ally', 'foeA', 'foeB'] : ['you', 'foeA'];
+    return view.seats.map((seat, index) => ({ slot: slots[index], seat }));
+  }
   const out: SlotAssignment[] = [];
   view.seats.forEach((seat) => {
     if (seat.relation === 'self') out.push({ slot: 'you', seat });
@@ -108,7 +115,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const [submitting, setSubmitting] = useState(false);
   const [copied, setCopied] = useState(false);
   const [turnAlert, setTurnAlert] = useState(false);
-  const [specialDecisionVersion, setSpecialDecisionVersion] = useState<number | null>(null);
+  const [specialCallout, setSpecialCallout] = useState<{ name: string; action: string } | null>(null);
+  const [specialModal, setSpecialModal] = useState<{ kind: SpecialKind; turnStartedAt: number } | null>(null);
   const previousTurnRef = useRef<Side | null>(null);
   const previousTurnStartedAtRef = useRef<number | null>(null);
 
@@ -128,6 +136,12 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     logIdRef.current += 1;
     const entry: LogEntry = { id: logIdRef.current, tag, text };
     setLog((prev) => [entry, ...prev].slice(0, LOG_LIMIT));
+  }, []);
+
+  const announceSpecial = useCallback(async (name: string, action: string) => {
+    setSpecialCallout({ name, action });
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_650));
+    setSpecialCallout(null);
   }, []);
 
   /* ------------------------------------------------------------------ scene ---- */
@@ -214,14 +228,9 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
         case 'battle':
           pushLog('CMD', 'Battle stations.');
           break;
-        case 'special-offer':
-          if (event.side === you) pushLog('CMD', 'A classified strike order awaits your decision');
-          break;
-        case 'special-declined':
-          pushLog('CMD', `${nameOf(event.side)} declined the classified strike`);
-          break;
         case 'special-strike':
           {
+            await announceSpecial(nameOf(event.by), 'SCORCHED EARTH');
             const fromSlot = slotForSide(view, event.by);
             const allySlot = slotForSide(view, event.ally);
             const targetSlot = slotForSide(view, event.target);
@@ -229,9 +238,40 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
             if (fromSlot && allySlot && ally) {
               await scene?.playSpecialBombardment({ from: fromSlot, to: allySlot, cells: event.bombed, marks: ally.board });
             }
-            if (targetSlot) await scene?.playSpecialSinks(targetSlot, event.destroyed);
+            if (targetSlot) {
+              for (const ship of event.destroyed) {
+                await scene?.playSpecialExplosion(targetSlot, ship);
+                await scene?.playSpecialSinks(targetSlot, [ship]);
+              }
+            }
           }
           pushLog('SNK', `${nameOf(event.by)} launched a scorched-earth strike on ${nameOf(event.target)}`);
+          break;
+        case 'special-mark': {
+          await announceSpecial(nameOf(event.by), 'TRAITOR\'S MARK');
+          const fromSlot = slotForSide(view, event.by);
+          const targetSlot = slotForSide(view, event.target);
+          const allySlot = slotForSide(view, event.ally);
+          if (fromSlot && targetSlot) {
+            await scene?.playShot({ from: fromSlot, to: targetSlot, idx: event.idx, hit: true, sunk: event.sunk });
+          }
+          if (allySlot) {
+            await scene?.playSpecialExplosion(allySlot, event.allySunk);
+            await scene?.playSpecialSinks(allySlot, [event.allySunk]);
+          }
+          pushLog('HIT', `${nameOf(event.by)} marked ${nameOf(event.target)} at ${cellName(event.idx)} — ${nameOf(event.ally)} lost a ship`);
+          break;
+        }
+        case 'special-salvo':
+          await announceSpecial(nameOf(event.by), 'RAPID SALVO');
+          pushLog('CMD', `${nameOf(event.by)} claimed two shots; ${nameOf(event.ally)} will lose three turns`);
+          break;
+        case 'special-bastion':
+          await announceSpecial(nameOf(event.by), 'ALLIED BASTION');
+          pushLog('CMD', `${nameOf(event.by)} is shielded for ${event.turns} enemy turns; fire is redirected to ${nameOf(event.ally)}`);
+          break;
+        case 'skipped':
+          pushLog('CMD', `${nameOf(event.side)}'s turn was skipped (${event.remaining} remaining)`);
           break;
         case 'shot': {
           const fromSlot = slotForSide(view, event.by);
@@ -277,7 +317,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
           break;
       }
     },
-    [pushLog],
+    [announceSpecial, pushLog],
   );
 
   const drain = useCallback(async () => {
@@ -293,7 +333,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
           initedRef.current = true;
           setDisplay(view);
           const self = view.seats.find((s) => s.relation === 'self');
-          if (!self?.fleet) pushLog('RDY', 'Place your fleet. Drag to orbit.');
+          if (view.spectating) pushLog('CMD', 'Spectating the engagement.');
+          else if (!self?.fleet) pushLog('RDY', 'Place your fleet. Drag to orbit.');
           continue;
         }
 
@@ -328,13 +369,28 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
   const yourSeat = display?.seats.find((s) => s.relation === 'self') ?? null;
   const allySeat = display?.seats.find((s) => s.relation === 'ally') ?? null;
-  const foeSeats = display?.seats.filter((s) => s.relation === 'foe') ?? [];
+  const foeSeats = useMemo(() => display?.seats.filter((s) => s.relation === 'foe') ?? [], [display]);
 
   const deploying = Boolean(display && yourSeat && !yourSeat.deployed && display.phase !== 'over');
   const battling = display?.phase === 'battle';
   const myTurn = battling && display?.turn === display?.you;
-  const specialMoveOffer = Boolean(display?.specialMoveOffer);
-  const specialDecisionSent = specialDecisionVersion === display?.version;
+  // `display` intentionally waits for scene animation; use the latest adapter
+  // snapshot for actions so a completed opponent move cannot leave a stale button live.
+  const authoritativeMyTurn = adapter.view?.phase === 'battle' && adapter.view.turn === adapter.view.you;
+  const canUseSpecial = useCallback((kind: SpecialKind) => {
+    if (!display || !authoritativeMyTurn || !display.specials[kind] || !allySeat || allySeat.eliminated) return false;
+    if (kind === 'scorched-earth') return foeSeats.some((foe) => !foe.eliminated && foe.ships.filter((ship) => !ship.sunk).length >= 2);
+    if (kind === 'rapid-salvo' || kind === 'allied-bastion') return true;
+    return allySeat.ships.some((ship) => !ship.sunk) && foeSeats.some((foe) => !foe.eliminated && foe.ships.some((ship) => !ship.sunk));
+  }, [allySeat, authoritativeMyTurn, display, foeSeats]);
+  const openSpecial = useCallback((kind: SpecialKind) => {
+    const live = adapterRef.current.view;
+    // Recheck in the click handler: the displayed snapshot can be temporarily
+    // behind while the previous shell animation is still finishing.
+    if (!live || live.phase !== 'battle' || live.turn !== live.you || !live.specials[kind]) return;
+    setSpecialModal({ kind, turnStartedAt: live.turnStartedAt ?? 0 });
+  }, []);
+  const specialModalOpen = Boolean(authoritativeMyTurn && myTurn && display?.turnStartedAt !== null && specialModal?.turnStartedAt === display.turnStartedAt);
 
   // Online snapshots and the Three.js scene initialize independently. Syncing
   // from the committed display guarantees that a teammate who joins after the
@@ -344,24 +400,20 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   }, [display, syncSceneRoster]);
 
   useEffect(() => {
-    if (adapter.mode !== 'solo' || specialDecisionSent || !specialMoveOffer || !adapter.respondSpecialMove) return;
-    const delay = Math.max(0, (display?.specialMoveExpiresAt ?? Date.now() + 20_000) - Date.now());
-    const timer = window.setTimeout(() => void adapter.respondSpecialMove?.(false), delay);
-    return () => window.clearTimeout(timer);
-  }, [adapter, display?.specialMoveExpiresAt, specialDecisionSent, specialMoveOffer]);
-  useEffect(() => {
-    if (!myTurn || specialMoveOffer || adapter.mode !== 'solo' || !display) return;
+    if (!myTurn || specialModalOpen || adapter.mode !== 'solo' || !display) return;
     const turnStartedAt = display.turnStartedAt;
     const timer = window.setTimeout(() => {
       const latest = adapterRef.current.view;
       if (!latest || latest.phase !== 'battle' || latest.turn !== latest.you || latest.turnStartedAt !== turnStartedAt) return;
-      const targets = latest.seats.filter((seat) => seat.relation === 'foe' && !seat.eliminated);
+      const targets = latest.seats.filter((seat) => (
+        seat.relation === 'foe' && !seat.eliminated && (!latest.forcedTarget || seat.side === latest.forcedTarget)
+      ));
       const choices = targets.flatMap((seat) => seat.board.flatMap((mark, idx) => (mark === 0 ? [{ side: seat.side, idx }] : [])));
       const choice = choices[Math.floor(Math.random() * choices.length)];
       if (choice) void adapterRef.current.fire(choice.side, choice.idx);
     }, Math.max(0, (display.turnStartedAt ?? Date.now()) + 12_000 - Date.now()));
     return () => window.clearTimeout(timer);
-  }, [adapter.mode, display, myTurn, specialMoveOffer]);
+  }, [adapter.mode, display, myTurn, specialModalOpen]);
   useEffect(() => {
     const currentTurn = display?.phase === 'battle' ? display.turn : null;
     const turnStartedAt = display?.phase === 'battle' ? display.turnStartedAt : null;
@@ -388,7 +440,11 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const livingFoeSlots = useMemo(() => {
     if (!display) return [];
     return assignSlots(display)
-      .filter((a) => (a.slot === 'foeA' || a.slot === 'foeB') && !a.seat.eliminated)
+      .filter((a) => (
+        (a.slot === 'foeA' || a.slot === 'foeB') &&
+        !a.seat.eliminated &&
+        (!display.forcedTarget || a.seat.side === display.forcedTarget)
+      ))
       .map((a) => a.slot);
   }, [display]);
 
@@ -399,16 +455,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     if (!scene || !display) return;
     const phase: ScenePhase =
       display.phase === 'battle' ? 'battle' : display.phase === 'over' ? 'over' : 'deploy';
-    const interactive = !busy && !specialMoveOffer && (deploying || Boolean(myTurn));
+    const interactive = !busy && !specialModalOpen && (deploying || Boolean(myTurn));
     scene.setPhase(phase, interactive);
 
     if (deploying) scene.setPickable(['you']);
-    else if (myTurn && !specialMoveOffer) scene.setPickable(livingFoeSlots);
+    else if (myTurn && !specialModalOpen) scene.setPickable(livingFoeSlots);
     else scene.setPickable([]);
 
     const actingSlot = display.phase === 'battle' && display.turn ? slotForSide(display, display.turn) : null;
     scene.setActingSlot(actingSlot);
-  }, [display, busy, deploying, myTurn, livingFoeSlots, specialMoveOffer]);
+  }, [display, busy, deploying, myTurn, livingFoeSlots, specialModalOpen]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -547,6 +603,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
   const turnLabel = (() => {
     if (!display) return 'CONNECTING';
+    if (display.spectating) return display.phase === 'over' ? 'ENGAGEMENT CLOSED' : 'SPECTATING';
     if (display.phase === 'over') return display.outcome === 'win' ? 'VICTORY' : 'DEFEAT';
     if (display.phase === 'battle') {
       if (display.turn === display.you) return 'YOUR TURN';
@@ -594,9 +651,9 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
 
   const roomFatal = fatal ?? glFatal;
 
-  const showLobby = display?.phase === 'lobby' && display.mode === 'duo';
+  const showLobby = !display?.spectating && display?.phase === 'lobby' && display.mode === 'duo';
   const showWaiting =
-    display?.phase === 'lobby' && display.mode === 'duel' && adapter.mode === 'online' && Boolean(adapter.roomId) && Boolean(inviteUrl);
+    !display?.spectating && display?.phase === 'lobby' && display.mode === 'duel' && adapter.mode === 'online' && Boolean(adapter.roomId) && Boolean(inviteUrl);
 
   const seatsByTeam: Record<Team, { name: string; ready: boolean; isYou: boolean }[]> = { red: [], blue: [] };
   if (display) {
@@ -617,11 +674,21 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
     <main className="relative h-dvh w-full overflow-hidden bg-abyss select-none">
       <canvas ref={canvasRef} className="absolute inset-0 block size-full touch-none" />
 
-      {turnAlert && !specialMoveOffer ? (
+      {turnAlert && !specialModalOpen ? (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
           <div className="animate-sb-turn-alert border-y border-brass/80 bg-[rgba(7,22,28,.88)] px-10 py-5 text-center shadow-[0_0_60px_rgba(255,122,47,.28)]">
             <p className="stencil mb-2 text-brass">Battle stations</p>
             <p className="font-display text-4xl font-bold tracking-[0.18em] text-flare sm:text-6xl">YOUR TURN</p>
+          </div>
+        </div>
+      ) : null}
+
+      {specialCallout ? (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
+          <div className="animate-sb-special-callout border-y border-flare/80 bg-[rgba(27,10,4,.88)] px-10 py-6 text-center shadow-[0_0_90px_rgba(255,84,24,.5)]">
+            <p className="stencil mb-3 text-brass">TACTICAL ACTION DEPLOYED</p>
+            <p className="font-display text-3xl font-bold tracking-[0.18em] text-parchment sm:text-5xl">{specialCallout.action}</p>
+            <p className="mt-3 font-mono text-[11px] tracking-[0.22em] text-flare">{specialCallout.name.toUpperCase()}</p>
           </div>
         </div>
       ) : null}
@@ -688,6 +755,45 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
               <Chat messages={display.chat} you={display.you} onSend={adapter.sendChat} />
             </div>
 
+            {battling && display.mode === 'duo' && adapter.useSpecialMove ? (
+              <TacticalActions
+                actions={[
+                  {
+                    kind: 'scorched-earth', icon: '✹', code: 'ORD-01', name: 'Scorched Earth',
+                    detail: 'Destroy 2 enemy ships · bomb 50% of ally grid',
+                    available: display.specials['scorched-earth'], active: canUseSpecial('scorched-earth'),
+                    onActivate: canUseSpecial('scorched-earth')
+                      ? () => openSpecial('scorched-earth')
+                      : undefined,
+                  },
+                  {
+                    kind: 'traitors-mark', icon: '◎', code: 'ORD-02', name: 'Traitor’s Mark',
+                    detail: 'Reveal a random enemy hit · sink 1 ally ship',
+                    available: display.specials['traitors-mark'], active: canUseSpecial('traitors-mark'),
+                    onActivate: canUseSpecial('traitors-mark')
+                      ? () => openSpecial('traitors-mark')
+                      : undefined,
+                  },
+                  {
+                    kind: 'rapid-salvo', icon: '»', code: 'ORD-03', name: 'Rapid Salvo',
+                    detail: 'Fire 2 shots · skip ally’s next 3 turns',
+                    available: display.specials['rapid-salvo'], active: canUseSpecial('rapid-salvo'),
+                    onActivate: canUseSpecial('rapid-salvo')
+                      ? () => openSpecial('rapid-salvo')
+                      : undefined,
+                  },
+                  {
+                    kind: 'allied-bastion', icon: '◈', code: 'ORD-04', name: 'Allied Bastion',
+                    detail: 'Shield yourself · redirect 4 enemy turns to ally',
+                    available: display.specials['allied-bastion'], active: canUseSpecial('allied-bastion'),
+                    onActivate: canUseSpecial('allied-bastion')
+                      ? () => openSpecial('allied-bastion')
+                      : undefined,
+                  },
+                ]}
+              />
+            ) : null}
+
             <div className="hidden sm:block">
               <TargetReadout
                 label={hover == null ? '——' : cellName(hover.idx)}
@@ -720,6 +826,8 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
             {display.phase === 'deploy' && yourSeat?.deployed ? (
               <StandbyOverlay message="Awaiting the rest of the crew" />
             ) : null}
+
+            {display.spectating ? <StandbyOverlay message="Spectating — fleet positions are classified" /> : null}
 
             {battling && display.turn !== display.you && !busy ? (
               <StandbyOverlay message={turnLabel === 'ENEMY TURN' ? 'Enemy is taking aim' : `${turnLabel.replace("'S TURN", '')} is taking aim`} />
@@ -776,17 +884,16 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
           />
         ) : null}
 
-        {display?.specialMoveOffer && !specialDecisionSent && adapter.respondSpecialMove ? (
+        {specialModalOpen && specialModal && canUseSpecial(specialModal.kind) && adapter.useSpecialMove ? (
           <SpecialMoveOverlay
+            kind={specialModal.kind}
             foes={foeSeats}
             onAccept={(target) => {
-              setSpecialDecisionVersion(display.version);
-              void adapter.respondSpecialMove?.(true, target);
+              const kind = specialModal.kind;
+              setSpecialModal(null);
+              void adapter.useSpecialMove?.(kind, target);
             }}
-            onDecline={() => {
-              setSpecialDecisionVersion(display.version);
-              void adapter.respondSpecialMove?.(false);
-            }}
+            onClose={() => setSpecialModal(null)}
           />
         ) : null}
 

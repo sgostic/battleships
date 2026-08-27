@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useState } from 'react';
-import type { SeatView, Side, Team } from '@/lib/game/match';
+import type { SeatView, Side, SpecialKind, Team } from '@/lib/game/match';
 import { Btn } from './Btn';
 
 function Shell({ label, children }: { label: string; children: React.ReactNode }) {
@@ -102,28 +102,38 @@ export function StandbyOverlay({ message }: { message: string }) {
 }
 
 /** A one-time 2v2-only decision. The engine has already selected its recipient. */
-export function SpecialMoveOverlay({ foes, onAccept, onDecline }: {
+export function SpecialMoveOverlay({ kind, foes, onAccept, onClose }: {
+  kind: SpecialKind;
   foes: SeatView[];
-  onAccept: (target: Side) => void;
-  onDecline: () => void;
+  onAccept: (target?: Side) => void;
+  onClose: () => void;
 }) {
   const eligible = foes.filter((foe) => !foe.eliminated && foe.ships.filter((ship) => !ship.sunk).length >= 2);
+  const scorchedEarth = kind === 'scorched-earth';
+  const rapidSalvo = kind === 'rapid-salvo';
+  const alliedBastion = kind === 'allied-bastion';
   return (
     <Shell label="Special strike available">
-      <p className="stencil text-brass">Classified order</p>
-      <h2 className="mt-3 font-display text-[22px] font-semibold tracking-[0.15em] text-flare">SCORCHED EARTH</h2>
+      <p className="stencil text-brass">Special strike</p>
+      <h2 className="mt-3 font-display text-[22px] font-semibold tracking-[0.15em] text-flare">{scorchedEarth ? 'SCORCHED EARTH' : rapidSalvo ? 'RAPID SALVO' : alliedBastion ? 'ALLIED BASTION' : 'TRAITOR\'S MARK'}</h2>
       <p className="mt-4 font-mono text-[11px] leading-relaxed tracking-[0.06em] text-parchment/70">
-        Bomb 50% of your teammate&apos;s board at random. In return, immediately destroy two ships on one enemy fleet.
+        {scorchedEarth
+          ? 'Bomb 50% of your teammate’s board at random, then immediately destroy two ships on one enemy fleet.'
+          : rapidSalvo
+            ? 'Take two shots immediately. In exchange, your teammate’s next three turns will be skipped.'
+            : alliedBastion
+              ? 'For the next four enemy turns, opponents cannot attack you and must target your teammate instead.'
+              : 'A single missile will find a random enemy ship and reveal its position. In exchange, one random ship on your teammate’s board is immediately sunk.'}
       </p>
       <div className="mt-6 flex flex-wrap justify-center gap-2">
-        {eligible.map((foe) => (
+        {scorchedEarth ? eligible.map((foe) => (
           <Btn key={foe.side} tone="primary" onClick={() => onAccept(foe.side)}>
             Strike {foe.name ?? 'enemy'}
           </Btn>
-        ))}
-        <Btn onClick={onDecline}>Decline</Btn>
+        )) : <Btn tone="primary" onClick={() => onAccept()}>{rapidSalvo ? 'Begin rapid salvo' : alliedBastion ? 'Raise bastion' : 'Fire random mark'}</Btn>}
+        <Btn onClick={onClose}>Stand down</Btn>
       </div>
-      <p className="mt-4 font-mono text-[9px] tracking-[0.08em] text-parchment/40">DECLINING PASSES THE OFFER TO THE NEXT COMMANDER&apos;S TURN</p>
+      <p className="mt-4 font-mono text-[9px] tracking-[0.08em] text-parchment/40">{rapidSalvo ? 'YOUR TWO SHOTS BEGIN IMMEDIATELY' : 'LAUNCHING THIS STRIKE ENDS YOUR TURN'}</p>
     </Shell>
   );
 }

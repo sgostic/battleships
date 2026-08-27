@@ -2422,11 +2422,30 @@ export class SeaBattleScene {
   /** Reveals and sinks the two ships destroyed by the special strike in sequence. */
   async playSpecialSinks(slot: Slot, ships: readonly Placement[]): Promise<void> {
     for (const ship of ships) {
-      if (this.slotMeta.get(slot)?.fogged) this.placeShip(slot, ship, true);
+      // A concurrent snapshot restore may already have rendered this wreck.
+      // Reset this one visual so a special's sacrifice is always witnessed.
+      const visual = this.visuals.get(slot)?.get(ship.key);
+      if (visual) visual.sunk = false;
+      this.placeShip(slot, ship, true);
       this.sinkShip(slot, ship, 0.85);
       await new Promise<void>((resolve) => setTimeout(resolve, 920));
       if (this.disposed) return;
     }
+  }
+
+  /** A concentrated blast used before the traitor's sacrificed ally ship sinks. */
+  async playSpecialExplosion(slot: Slot, ship: Placement): Promise<void> {
+    if (this.slotMeta.get(slot)?.fogged) this.placeShip(slot, ship, true);
+    const center = ship.cells[Math.floor(ship.cells.length / 2)];
+    for (const idx of ship.cells) {
+      const point = this.worldCell(slot, idx).add(new THREE.Vector3(0, 0.35, 0));
+      this.boom(point);
+    }
+    this.shake(0.8);
+    await new Promise<void>((resolve) => setTimeout(resolve, 460));
+    if (this.disposed) return;
+    // Keep the centre hot for a beat after the initial cell-by-cell detonation.
+    this.boom(this.worldCell(slot, center).add(new THREE.Vector3(0, 0.5, 0)));
   }
 
   private sinkShip(slot: Slot, placement: Placement, duration = 2.2): void {

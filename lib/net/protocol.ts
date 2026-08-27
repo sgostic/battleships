@@ -2,6 +2,12 @@
 
 /** Players authenticate with an opaque per-room token, not a cookie session. */
 export const PLAYER_TOKEN_HEADER = 'x-player-token';
+export const SPECTATOR_TOKEN_PREFIX = 'spectator:';
+
+/** A spectator token has no authority to mutate a match. */
+export function isSpectatorToken(token: string): boolean {
+  return token.startsWith(SPECTATOR_TOKEN_PREFIX) && token.length > SPECTATOR_TOKEN_PREFIX.length;
+}
 
 /** Room codes are short, unambiguous, and case-insensitive. */
 export const ROOM_CODE_LENGTH = 6;

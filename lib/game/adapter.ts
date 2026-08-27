@@ -5,7 +5,7 @@
  * machine in the browser. The shell cannot tell the difference.
  */
 
-import type { MatchView, Side, Team } from './match';
+import type { MatchView, Side, SpecialKind, Team } from './match';
 import type { Placement } from './rules';
 
 export type MatchAdapter = {
@@ -19,7 +19,7 @@ export type MatchAdapter = {
   clearError: () => void;
   deploy: (fleet: Placement[]) => Promise<void>;
   fire: (target: Side, idx: number) => Promise<void>;
-  respondSpecialMove?: (accept: boolean, target?: Side) => Promise<void>;
+  useSpecialMove?: (kind: SpecialKind, target?: Side) => Promise<void>;
   rematch: () => Promise<void>;
   sendChat?: (text: string) => Promise<void>;
   /** Lobby-only. Absent when the match has no team/ready step (solo, duel). */

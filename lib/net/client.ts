@@ -1,13 +1,14 @@
 /** Browser-side wrappers around the room route handlers. */
 
-import type { MatchView, Mode, Side, Team } from '../game/match';
+import type { MatchView, Mode, Side, SpecialKind, Team } from '../game/match';
 import type { Placement } from '../game/rules';
 import { PLAYER_TOKEN_HEADER } from './protocol';
 
 export type Session = {
   roomId: string;
   token: string;
-  side: Side;
+  side: Side | null;
+  spectating: boolean;
   view: MatchView;
   matched?: boolean;
 };
@@ -161,9 +162,9 @@ export function postAutoFire(roomId: string, token: string, since: number): Prom
   return request<{ view: MatchView }>(`/api/rooms/${encodeURIComponent(roomId)}/fire?since=${since}`, { method: 'POST', body: JSON.stringify({ auto: true }), token }).then(({ view }) => view);
 }
 
-export function postSpecialMove(roomId: string, token: string, accept: boolean, target: Side | undefined, since: number): Promise<MatchView> {
+export function postSpecialMove(roomId: string, token: string, kind: SpecialKind, target: Side | undefined, since: number): Promise<MatchView> {
   return request<{ view: MatchView }>(`/api/rooms/${encodeURIComponent(roomId)}/special?since=${since}`, {
-    method: 'POST', body: JSON.stringify({ accept, target }), token,
+    method: 'POST', body: JSON.stringify({ kind, target }), token,
   }).then(({ view }) => view);
 }
 

@@ -24,6 +24,8 @@ import {
 export type Side = 'a' | 'b' | 'c' | 'd';
 export type Team = 'red' | 'blue';
 export type Mode = 'duel' | 'duo';
+export type SpecialKind = 'scorched-earth' | 'traitors-mark' | 'rapid-salvo' | 'allied-bastion';
+export const SPECIAL_KINDS: readonly SpecialKind[] = ['scorched-earth', 'traitors-mark', 'rapid-salvo', 'allied-bastion'];
 
 export const SEATS: Record<Mode, readonly Side[]> = {
   duel: ['a', 'b'],
@@ -84,9 +86,11 @@ export type MatchEvent =
       next: Side | null;
     }
   | { seq: number; type: 'eliminated'; side: Side }
-  | { seq: number; type: 'special-offer'; side: Side }
-  | { seq: number; type: 'special-declined'; side: Side }
   | { seq: number; type: 'special-strike'; by: Side; ally: Side; bombed: number[]; target: Side; destroyed: SunkReveal[] }
+  | { seq: number; type: 'special-mark'; by: Side; ally: Side; allySunk: SunkReveal; target: Side; idx: number; sunk: SunkReveal | null }
+  | { seq: number; type: 'special-salvo'; by: Side; ally: Side; shots: number; skips: number }
+  | { seq: number; type: 'special-bastion'; by: Side; ally: Side; turns: number }
+  | { seq: number; type: 'skipped'; side: Side; remaining: number }
   | { seq: number; type: 'over'; winner: Team }
   | { seq: number; type: 'left'; side: Side }
   | { seq: number; type: 'reset' };
@@ -99,22 +103,18 @@ export type MatchRules = {
   lobbyReady: boolean;
 };
 
-/** One early-match, 2v2-only high-risk strike. */
+/** The 2v2-only high-risk strike. Each commander has one charge per match. */
 export type SpecialMoveState = {
-  /** Randomly selected turn start (5–15) at which offers may begin. */
-  triggerTurn: number;
-  turnCount: number;
-  offerSide: Side | null;
-  /** The modal gets its own clock; the normal shot clock is paused meanwhile. */
-  offerExpiresAt: number | null;
-  asked: Side[];
-  resolved: boolean;
+  usedBy: Record<SpecialKind, Side[]>;
+  rapidSalvo: { side: Side; shotsRemaining: number } | null;
+  allySkips: { side: Side; remaining: number } | null;
+  bastion: { protectedSide: Side; allySide: Side; remainingEnemyTurns: number; activeEnemy: Side | null } | null;
 };
 
 export type MatchState = {
   id: string;
   /** Bumped whenever the shape of this blob changes incompatibly. */
-  schema: 4;
+  schema: 8;
   mode: Mode;
   version: number;
   createdAt: number;
@@ -155,7 +155,7 @@ export function createMatch(
 ): MatchState {
   return {
     id,
-    schema: 4,
+    schema: 8,
     mode,
     version: 0,
     createdAt: now,
@@ -173,9 +173,7 @@ export function createMatch(
       extraShotOnHit: rules.extraShotOnHit ?? true,
       lobbyReady: rules.lobbyReady ?? mode === 'duo',
     },
-    specialMove: mode === 'duo'
-      ? { triggerTurn: Math.floor(Math.random() * 11) + 5, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
-      : null,
+    specialMove: mode === 'duo' ? newSpecialMoveState() : null,
     open,
   };
 }
@@ -267,6 +265,11 @@ export function isJoinable(state: MatchState): boolean {
   return seatsTaken(state) < seatsOf(state).length && state.phase === 'lobby';
 }
 
+/** A room with no remaining crew has no resumable state. */
+export function shouldDisposeRoom(state: MatchState): boolean {
+  return seatsTaken(state) === 0;
+}
+
 /** Red seat 1, Blue seat 1, Red seat 2, Blue seat 2, … — frozen once the battle starts. */
 function buildTurnOrder(state: MatchState): Side[] {
   if (state.mode === 'duel') return ['a', 'b'];
@@ -287,31 +290,39 @@ function advanceTurn(state: MatchState, from: Side): Side | null {
   for (let step = 1; step <= order.length; step++) {
     const side = order[(start + step) % order.length];
     const player = state.players[side];
-    if (player && !player.eliminated) return side;
+    if (player && !player.eliminated) {
+      const skips = state.specialMove?.allySkips;
+      if (skips?.side === side && skips.remaining > 0) {
+        skips.remaining -= 1;
+        emit(state, { type: 'skipped', side, remaining: skips.remaining });
+        if (skips.remaining === 0) state.specialMove!.allySkips = null;
+        continue;
+      }
+      return side;
+    }
   }
   return null;
-}
-
-function offerSpecialMove(state: MatchState, now: number): void {
-  const special = state.specialMove;
-  if (!special || special.resolved || special.offerSide || special.turnCount < special.triggerTurn || !state.turn) return;
-  const player = state.players[state.turn];
-  if (!player || player.eliminated || special.asked.includes(state.turn)) {
-    if (special.asked.length >= SEATS.duo.length) special.resolved = true;
-    return;
-  }
-  special.offerSide = state.turn;
-  special.offerExpiresAt = now + 20_000;
-  emit(state, { type: 'special-offer', side: state.turn });
 }
 
 /** Starts an actual new turn. Extra shots deliberately do not count as a new turn. */
 function startTurn(state: MatchState, side: Side | null, now: number): void {
   state.turn = side;
   state.turnStartedAt = side === null ? null : now;
-  if (!side) return;
-  if (state.specialMove) state.specialMove.turnCount += 1;
-  offerSpecialMove(state, now);
+  const bastion = state.specialMove?.bastion;
+  if (!bastion || !side) return;
+  const protectedTeam = state.players[bastion.protectedSide]?.team;
+  const ally = state.players[bastion.allySide];
+  const actor = state.players[side];
+  if (!protectedTeam || !ally || ally.eliminated) {
+    state.specialMove!.bastion = null;
+  } else if (bastion.remainingEnemyTurns === 0 && bastion.activeEnemy !== side) {
+    state.specialMove!.bastion = null;
+  } else if (actor?.team !== protectedTeam && bastion.remainingEnemyTurns > 0) {
+    bastion.activeEnemy = side;
+    bastion.remainingEnemyTurns -= 1;
+  } else if (actor?.team === protectedTeam) {
+    bastion.activeEnemy = null;
+  }
 }
 
 function sunkReveal(ship: ShipState): SunkReveal {
@@ -325,6 +336,15 @@ function randomCells(count: number): number[] {
     [cells[i], cells[j]] = [cells[j], cells[i]];
   }
   return cells.slice(0, count);
+}
+
+function newSpecialMoveState(): SpecialMoveState {
+  return {
+    usedBy: { 'scorched-earth': [], 'traitors-mark': [], 'rapid-salvo': [], 'allied-bastion': [] },
+    rapidSalvo: null,
+    allySkips: null,
+    bastion: null,
+  };
 }
 
 function canStart(state: MatchState): boolean {
@@ -432,7 +452,6 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   if (!shooter) return fail('You are not seated in this match', 403);
   if (state.phase !== 'battle') return fail('No battle in progress', 409);
   if (state.turn !== side) return fail('Not your turn', 409);
-  if (state.specialMove?.offerSide === side) return fail('Respond to the special strike offer before firing', 409);
 
   const seats = seatsOf(state);
   if (typeof targetRaw !== 'string' || !(seats as string[]).includes(targetRaw)) {
@@ -442,6 +461,10 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   const target = state.players[targetSide];
   if (!target) return fail('That seat is empty', 409);
   if (target.team === shooter.team) return fail('That is a friendly board', 409);
+  const bastion = state.specialMove?.bastion;
+  if (bastion?.activeEnemy === side && targetSide === bastion.protectedSide) {
+    return fail('Allied Bastion is active — you must target their teammate', 409);
+  }
   if (target.eliminated) return fail('That fleet is already destroyed', 409);
   if (!target.ships) return fail('Opponent has not deployed', 409);
 
@@ -470,6 +493,7 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   if (target.ships.every((s) => s.sunk) && !target.eliminated) {
     target.eliminated = true;
     emit(state, { type: 'eliminated', side: targetSide });
+    if (state.specialMove?.bastion?.allySide === targetSide) state.specialMove.bastion = null;
   }
 
   let next: Side | null;
@@ -480,7 +504,18 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
     state.turn = null;
     state.winner = shooter.team;
   } else {
-    next = hit && state.rules.extraShotOnHit ? side : advanceTurn(state, side);
+    const salvo = state.specialMove?.rapidSalvo;
+    if (salvo?.side === side) {
+      salvo.shotsRemaining -= 1;
+      if (salvo.shotsRemaining > 0) {
+        next = side;
+      } else {
+        state.specialMove!.rapidSalvo = null;
+        next = hit && state.rules.extraShotOnHit ? side : advanceTurn(state, side);
+      }
+    } else {
+      next = hit && state.rules.extraShotOnHit ? side : advanceTurn(state, side);
+    }
     if (next === side) {
       state.turn = next;
       state.turnStartedAt = now;
@@ -495,68 +530,91 @@ export function fire(state: MatchState, side: Side, targetRaw: unknown, idxRaw: 
   return done(undefined);
 }
 
-/** Accept or decline the one 2v2 special strike offered to this commander. */
-export function respondSpecialMove(state: MatchState, side: Side, acceptRaw: unknown, targetRaw: unknown, now: number): Result {
+/** Spends one of this commander's 2v2 tactical action charges. */
+export function launchSpecialMove(state: MatchState, side: Side, kindRaw: unknown, targetRaw: unknown, now: number): Result {
   const special = state.specialMove;
   const player = state.players[side];
   if (!player) return fail('You are not seated in this match', 403);
   if (state.phase !== 'battle' || state.mode !== 'duo') return fail('No special strike is available', 409);
-  if (special?.offerSide !== side || state.turn !== side) return fail('This special strike is not assigned to you', 409);
-  if (typeof acceptRaw !== 'boolean') return fail('Malformed special strike response', 422);
-
-  if (!acceptRaw) {
-    special.asked.push(side);
-    special.offerSide = null;
-    special.offerExpiresAt = null;
+  if (state.turn !== side) return fail('Not your turn', 409);
+  if (!special || !SPECIAL_KINDS.includes(kindRaw as SpecialKind)) return fail('Unknown tactical action', 422);
+  const kind = kindRaw as SpecialKind;
+  if (special.usedBy[kind].includes(side)) return fail('You have already spent this tactical action', 409);
+  const allySide = SEATS.duo.find((candidate) => candidate !== side && state.players[candidate]?.team === player.team);
+  const ally = allySide ? state.players[allySide] : null;
+  if (!allySide || !ally || !ally.ships || ally.eliminated) return fail('Your teammate must still be afloat', 409);
+  if (kind === 'rapid-salvo') {
+    special.usedBy[kind].push(side);
+    special.rapidSalvo = { side, shotsRemaining: 2 };
+    special.allySkips = { side: allySide, remaining: 3 };
     player.lastSeen = now;
     state.turnStartedAt = now;
-    if (special.asked.length >= SEATS.duo.length) special.resolved = true;
-    emit(state, { type: 'special-declined', side });
+    emit(state, { type: 'special-salvo', by: side, ally: allySide, shots: 2, skips: 3 });
     touch(state, now);
     return done(undefined);
   }
+  if (kind === 'allied-bastion') {
+    special.usedBy[kind].push(side);
+    special.bastion = { protectedSide: side, allySide, remainingEnemyTurns: 4, activeEnemy: null };
+    player.lastSeen = now;
+    emit(state, { type: 'special-bastion', by: side, ally: allySide, turns: 4 });
+    startTurn(state, advanceTurn(state, side), now);
+    touch(state, now);
+    return done(undefined);
+  }
+  const allyTargets = ally.ships.filter((ship) => !ship.sunk);
+  if (!allyTargets.length) return fail('Your teammate has no ship left to sacrifice', 409);
 
-  if (special.offerExpiresAt !== null && now >= special.offerExpiresAt) acceptRaw = false;
-  if (!acceptRaw) return respondSpecialMove(state, side, false, null, now);
-  if (typeof targetRaw !== 'string' || !(SEATS.duo as readonly string[]).includes(targetRaw)) return fail('Choose an opposing fleet', 422);
-  const targetSide = targetRaw as Side;
-  const target = state.players[targetSide];
-  const allySide = SEATS.duo.find((candidate) => candidate !== side && state.players[candidate]?.team === player.team);
-  const ally = allySide ? state.players[allySide] : null;
-  if (!allySide || !ally || !ally.ships) return fail('Your teammate has no deployed fleet', 409);
-  if (!target || target.team === player.team || target.eliminated || !target.ships) return fail('Choose a living opponent', 409);
-  const destroyable = target.ships.filter((ship) => !ship.sunk);
-  if (destroyable.length < 2) return fail('That opponent has fewer than two ships remaining', 409);
-
-  special.asked.push(side);
-  special.offerSide = null;
-  special.offerExpiresAt = null;
-  player.lastSeen = now;
-  state.turnStartedAt = now;
-  const bombed = randomCells(Math.ceil(CELLS / 2));
-  for (const idx of bombed) {
-    if (ally.incoming[idx] !== 0) continue;
-    const ship = ally.ships.find((candidate) => !candidate.sunk && candidate.cells.includes(idx));
-    ally.incoming[idx] = ship ? 2 : 1;
-    if (ship) ship.hits += 1;
+  if (kind === 'scorched-earth') {
+    if (typeof targetRaw !== 'string' || !(SEATS.duo as readonly string[]).includes(targetRaw)) return fail('Choose an opposing fleet', 422);
+    const targetSide = targetRaw as Side;
+    const target = state.players[targetSide];
+    if (!target || target.team === player.team || target.eliminated || !target.ships) return fail('Choose a living opponent', 409);
+    const destroyable = target.ships.filter((ship) => !ship.sunk);
+    if (destroyable.length < 2) return fail('That opponent has fewer than two ships remaining', 409);
+    special.usedBy[kind].push(side);
+    player.lastSeen = now;
+    const bombed = randomCells(Math.ceil(CELLS / 2));
+    for (const idx of bombed) {
+      if (ally.incoming[idx] !== 0) continue;
+      const ship = ally.ships.find((candidate) => !candidate.sunk && candidate.cells.includes(idx));
+      ally.incoming[idx] = ship ? 2 : 1;
+      if (ship) ship.hits += 1;
+    }
+    ally.ships.filter((ship) => !ship.sunk && ship.hits >= ship.cells.length).forEach((ship) => { ship.sunk = true; });
+    const destroyed = destroyable.sort(() => Math.random() - 0.5).slice(0, 2).map((ship) => {
+      ship.sunk = true; ship.hits = ship.cells.length;
+      ship.cells.forEach((idx) => { target.incoming[idx] = 2; });
+      return sunkReveal(ship);
+    });
+    if (target.ships.every((ship) => ship.sunk) && !target.eliminated) {
+      target.eliminated = true; emit(state, { type: 'eliminated', side: targetSide });
+    }
+    emit(state, { type: 'special-strike', by: side, ally: allySide, bombed, target: targetSide, destroyed });
+  } else {
+    const enemySides = seatsOf(state).filter((candidate) => {
+      const enemy = state.players[candidate];
+      return Boolean(enemy && enemy.team !== player.team && !enemy.eliminated && enemy.ships?.some((ship) => !ship.sunk));
+    });
+    const targetSide = enemySides[Math.floor(Math.random() * enemySides.length)];
+    const target = targetSide ? state.players[targetSide] : null;
+    if (!target || !target.ships) return fail('No enemy ship can be marked', 409);
+    const targetShips = target.ships.filter((ship) => !ship.sunk);
+    const targetShip = targetShips[Math.floor(Math.random() * targetShips.length)];
+    const idx = targetShip.cells.find((cell) => target.incoming[cell] === 0) ?? targetShip.cells[0];
+    const allyShip = allyTargets[Math.floor(Math.random() * allyTargets.length)];
+    special.usedBy[kind].push(side);
+    player.lastSeen = now; player.shotsFired += 1; player.hitsLanded += 1;
+    target.incoming[idx] = 2; targetShip.hits += 1;
+    let sunk: SunkReveal | null = null;
+    if (targetShip.hits >= targetShip.cells.length) { targetShip.sunk = true; sunk = sunkReveal(targetShip); }
+    allyShip.sunk = true; allyShip.hits = allyShip.cells.length;
+    allyShip.cells.forEach((cell) => { ally.incoming[cell] = 2; });
+    const allySunk = sunkReveal(allyShip);
+    if (target.ships.every((ship) => ship.sunk) && !target.eliminated) { target.eliminated = true; emit(state, { type: 'eliminated', side: targetSide }); }
+    emit(state, { type: 'special-mark', by: side, ally: allySide, allySunk, target: targetSide, idx, sunk });
   }
-  ally.ships.filter((ship) => !ship.sunk && ship.hits >= ship.cells.length).forEach((ship) => { ship.sunk = true; });
-  const destroyed = destroyable.sort(() => Math.random() - 0.5).slice(0, 2).map((ship) => {
-    ship.sunk = true;
-    ship.hits = ship.cells.length;
-    ship.cells.forEach((idx) => { target.incoming[idx] = 2; });
-    return sunkReveal(ship);
-  });
-  if (ally.ships.every((ship) => ship.sunk) && !ally.eliminated) {
-    ally.eliminated = true;
-    emit(state, { type: 'eliminated', side: allySide });
-  }
-  if (target.ships.every((ship) => ship.sunk) && !target.eliminated) {
-    target.eliminated = true;
-    emit(state, { type: 'eliminated', side: targetSide });
-  }
-  special.resolved = true;
-  emit(state, { type: 'special-strike', by: side, ally: allySide, bombed, target: targetSide, destroyed });
+  if (ally.ships.every((ship) => ship.sunk) && !ally.eliminated) { ally.eliminated = true; emit(state, { type: 'eliminated', side: allySide }); }
   const teamsAlive = TEAMS.filter((team) => livingOn(state, team).length > 0);
   if (teamsAlive.length === 1) {
     state.phase = 'over'; state.turn = null; state.turnStartedAt = null; state.winner = teamsAlive[0];
@@ -571,10 +629,10 @@ export function respondSpecialMove(state: MatchState, side: Side, acceptRaw: unk
 
 export function autoFire(state: MatchState, side: Side, now: number): Result<{ target: Side; idx: number }> {
   if (state.turnStartedAt === null || now - state.turnStartedAt < 12_000) return fail('The shot clock has not expired', 409);
-  if (state.specialMove?.offerSide === side) return fail('The special strike decision is still pending', 409);
+  const protectedSide = state.specialMove?.bastion?.activeEnemy === side ? state.specialMove.bastion.protectedSide : null;
   const choices = seatsOf(state).flatMap((target) => {
     const player = state.players[target];
-    if (!player || player.team === teamOf(state, side) || player.eliminated || !player.ships) return [];
+    if (!player || target === protectedSide || player.team === teamOf(state, side) || player.eliminated || !player.ships) return [];
     return player.incoming.flatMap((mark, idx) => (mark === 0 ? [{ target, idx }] : []));
   });
   if (!choices.length) return fail('No legal targets remain', 409);
@@ -613,9 +671,7 @@ export function requestRematch(
     state.turn = null;
     state.winner = null;
     state.turnOrder = [];
-    state.specialMove = state.mode === 'duo'
-      ? { triggerTurn: Math.floor(Math.random() * 11) + 5, turnCount: 0, offerSide: null, offerExpiresAt: null, asked: [], resolved: false }
-      : null;
+    state.specialMove = state.mode === 'duo' ? newSpecialMoveState() : null;
     emit(state, { type: 'reset' });
   }
   touch(state, now);
@@ -703,10 +759,15 @@ export type MatchView = {
   phase: Phase;
   eventSeq: number;
   rules: MatchRules;
-  specialMoveOffer: boolean;
-  specialMoveExpiresAt: number | null;
-  you: Side;
+  /** Remaining per-player tactical action charges. */
+  specials: Record<SpecialKind, boolean>;
+  /** When set, this viewer must target this enemy while Allied Bastion is active. */
+  forcedTarget: Side | null;
+  /** Null for a read-only spectator. */
+  you: Side | null;
   yourTeam: Team | null;
+  /** Spectators receive public board marks and sunk reveals, but no fleets. */
+  spectating: boolean;
   seats: SeatView[];
   turn: Side | null;
   turnStartedAt: number | null;
@@ -729,9 +790,9 @@ function summarize(ships: ShipState[] | null): FleetSummary[] {
   }));
 }
 
-function seatView(state: MatchState, viewer: Side, side: Side): SeatView {
+function seatView(state: MatchState, viewer: Side | null, side: Side): SeatView {
   const p = state.players[side];
-  const viewerTeam = state.players[viewer]?.team ?? null;
+  const viewerTeam = viewer ? state.players[viewer]?.team ?? null : null;
   const relation: Relation =
     side === viewer ? 'self' : p?.team && p.team === viewerTeam ? 'ally' : 'foe';
 
@@ -765,9 +826,9 @@ function seatView(state: MatchState, viewer: Side, side: Side): SeatView {
   };
 }
 
-export function viewFor(state: MatchState, viewer: Side, since = 0): MatchView {
-  const me = state.players[viewer];
-  if (!me) throw new Error('viewFor called for an unseated side');
+export function viewFor(state: MatchState, viewer: Side | null, since = 0): MatchView {
+  const me = viewer ? state.players[viewer] : null;
+  if (viewer && !me) throw new Error('viewFor called for an unseated side');
 
   return {
     roomId: state.id,
@@ -776,15 +837,18 @@ export function viewFor(state: MatchState, viewer: Side, since = 0): MatchView {
     phase: state.phase,
     eventSeq: state.eventSeq,
     rules: state.rules,
-    specialMoveOffer: state.specialMove?.offerSide === viewer,
-    specialMoveExpiresAt: state.specialMove?.offerSide === viewer ? state.specialMove.offerExpiresAt : null,
+    specials: Object.fromEntries(SPECIAL_KINDS.map((kind) => [kind, Boolean(viewer && state.specialMove && !state.specialMove.usedBy[kind].includes(viewer))])) as Record<SpecialKind, boolean>,
+    forcedTarget: state.specialMove?.bastion?.activeEnemy === viewer
+      ? state.specialMove.bastion.allySide
+      : null,
     you: viewer,
-    yourTeam: me.team,
+    yourTeam: me?.team ?? null,
+    spectating: viewer === null,
     seats: seatsOf(state).map((s) => seatView(state, viewer, s)),
     turn: state.turn,
     turnStartedAt: state.turnStartedAt,
     turnOrder: state.turnOrder,
-    outcome: state.winner ? (state.winner === me.team ? 'win' : 'loss') : null,
+    outcome: state.winner && me ? (state.winner === me.team ? 'win' : 'loss') : null,
     events: state.events.filter((e) => e.seq > since),
     chat: state.chat ?? [],
   };
