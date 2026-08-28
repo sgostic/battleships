@@ -159,7 +159,9 @@ export type MatchState = {
 
 /** Events older than this are dropped; a lagging client resyncs from the snapshot. */
 const EVENT_HISTORY = 160;
-const SPACE_CRISIS_CHANCE = 0.25;
+// Space Crisis is enabled for every newly started 2v2 battle. The event still
+// waits for the normal trigger: damage leaving a living player with one ship.
+const SPACE_CRISIS_CHANCE = 1;
 const SPACE_TRANSITION_MS = 8_000;
 const ASTEROID_RESOLUTION_MS = 3_000;
 
