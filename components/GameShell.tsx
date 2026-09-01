@@ -125,6 +125,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const previousTurnStartedAtRef = useRef<number | null>(null);
 
   const appliedRef = useRef(-1);
+  const lastSceneSyncVersionRef = useRef(-1);
   const adapterRef = useRef(adapter);
   useEffect(() => {
     adapterRef.current = adapter;
@@ -167,6 +168,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
       sceneRef.current = null;
       initedRef.current = false;
       appliedRef.current = -1;
+      lastSceneSyncVersionRef.current = -1;
     };
   }, []);
 
@@ -186,6 +188,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
   const syncSceneRoster = useCallback((view: MatchView, reset = false) => {
     const scene = sceneRef.current;
     if (!scene) return;
+    if (!reset && lastSceneSyncVersionRef.current === view.version) return;
     const assignments = assignSlots(view);
     scene.setRoster(assignments.map(({ slot, seat }) => seatSpec(seat, slot)));
     if (reset) scene.reset();
@@ -196,6 +199,7 @@ export function GameShell({ adapter, fatal = null, inviteUrl, onLeave, onNicknam
       if (seat.eliminated) scene.markEliminated(slot);
     });
     scene.setArena(view.arena);
+    lastSceneSyncVersionRef.current = view.version;
   }, []);
 
   const applySnapshot = useCallback((view: MatchView) => {

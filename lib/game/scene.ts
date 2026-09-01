@@ -89,6 +89,7 @@ type BoardRig = {
   rail: THREE.MeshStandardMaterial;
   plate: THREE.Mesh;
   plateMat: THREE.MeshBasicMaterial;
+  plateKey: string;
   basePos: THREE.Vector3;
   phase: number;
   spaceLift: number;
@@ -154,7 +155,6 @@ export class SeaBattleScene {
   private camera!: THREE.PerspectiveCamera;
   private seaFog!: THREE.Fog;
   private sunDir!: THREE.Vector3;
-  private clock = new THREE.Clock();
   private raf = 0;
   private idleTimer = 0;
   private scheduled: 'raf' | 'idle' | null = null;
@@ -212,6 +212,9 @@ export class SeaBattleScene {
   private target = new THREE.Vector3(0, 0.9, 0);
   private mobile = false;
   private sized = false;
+  private renderPixelRatio = 0;
+  private shadowDirty = true;
+  private lastShadowAt = -Infinity;
 
   private ray = new THREE.Raycaster();
   private hover: BoardHit | null = null;
@@ -245,11 +248,11 @@ export class SeaBattleScene {
   private readonly scratchWorld = new THREE.Vector3();
   private readonly scratchCamera = new THREE.Vector3();
   private readonly scratchColor = new THREE.Color();
+  private readonly scratchMatrix = new THREE.Matrix4();
   private readonly onVisibilityChange = (): void => {
     if (document.hidden) {
       this.stopLoop();
     } else {
-      this.clock.getDelta();
       this.lastFrameAt = performance.now();
       this.startLoop();
     }
@@ -291,13 +294,12 @@ export class SeaBattleScene {
       alpha: false,
       powerPreference: 'high-performance',
     });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.22;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.autoUpdate = false;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer = renderer;
 
     this.scene = new THREE.Scene();
@@ -313,7 +315,7 @@ export class SeaBattleScene {
     const sun = new THREE.DirectionalLight(0xffc078, 3.7);
     sun.position.copy(this.sunDir).multiplyScalar(110);
     sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.mapSize.set(1024, 1024);
     const sc = sun.shadow.camera;
     sc.left = -28;
     sc.right = 28;
@@ -345,6 +347,7 @@ export class SeaBattleScene {
   }
 
   private wake(highRateMs = 350): void {
+    this.shadowDirty = true;
     this.highRateUntil = Math.max(this.highRateUntil, performance.now() + highRateMs);
     if (this.scheduled === 'idle') {
       this.stopLoop();
@@ -371,7 +374,7 @@ export class SeaBattleScene {
         this.scheduled = null;
         this.idleTimer = 0;
         this.loop(performance.now());
-      }, 1000 / 30);
+      }, 1000 / 20);
     }
   }
 
@@ -379,6 +382,12 @@ export class SeaBattleScene {
     if (this.disposed || document.hidden) return;
     this.scheduled = null;
     this.raf = 0;
+    // requestAnimationFrame follows the display refresh rate. Cap expensive
+    // scene renders to 60 FPS on 120/144 Hz displays while retaining vsync.
+    if (this.highRate(now) && now - this.lastFrameAt < 1000 / 60 - 1) {
+      this.scheduleNext();
+      return;
+    }
     const dt = Math.min(0.05, Math.max(0, (now - this.lastFrameAt) / 1000));
     this.lastFrameAt = now;
     this.frame(dt);
@@ -417,8 +426,13 @@ export class SeaBattleScene {
     const el = this.renderer.domElement;
     const w = el.clientWidth || window.innerWidth;
     const h = el.clientHeight || window.innerHeight;
-    this.renderer.setSize(w, h, false);
     this.mobile = w < 760;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, this.mobile ? 1.25 : 1.5);
+    if (pixelRatio !== this.renderPixelRatio) {
+      this.renderPixelRatio = pixelRatio;
+      this.renderer.setPixelRatio(pixelRatio);
+    }
+    this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.fov = this.mobile ? 56 : 44;
     this.camera.updateProjectionMatrix();
@@ -1014,6 +1028,7 @@ export class SeaBattleScene {
    * whole table for the roster size, and refreshes rails/nameplates/fog.
    */
   setRoster(specs: SlotSpec[]): void {
+    this.shadowDirty = true;
     const sizeChanged = specs.length !== this.rosterLength || !this.sized;
     this.rosterLength = specs.length;
     this.slotMeta.clear();
@@ -1035,9 +1050,15 @@ export class SeaBattleScene {
     rig.rail.emissive.set(hex);
     rig.rail.emissiveIntensity = spec.eliminated ? 0 : spec.relation === 'self' ? 0.75 : 0.4;
     rig.blanket.visible = spec.fogged && !spec.eliminated;
-    rig.plateMat.map = this.plateTex(spec);
-    rig.plateMat.map.colorSpace = THREE.SRGBColorSpace;
-    rig.plateMat.needsUpdate = true;
+    const plateKey = `${spec.name}|${spec.team ?? ''}|${spec.relation}|${spec.eliminated ? 1 : 0}`;
+    if (plateKey !== rig.plateKey) {
+      const previous = rig.plateMat.map;
+      rig.plateMat.map = this.plateTex(spec);
+      rig.plateMat.map.colorSpace = THREE.SRGBColorSpace;
+      rig.plateMat.needsUpdate = true;
+      rig.plateKey = plateKey;
+      previous?.dispose();
+    }
     rig.grp.position.y = spec.eliminated ? rig.basePos.y - 0.22 : rig.basePos.y;
   }
 
@@ -1269,6 +1290,7 @@ export class SeaBattleScene {
       rail: railMat,
       plate: namePlate,
       plateMat,
+      plateKey: '',
       basePos,
       phase: Math.random() * 6.28,
       spaceLift: 0,
@@ -2499,6 +2521,7 @@ export class SeaBattleScene {
     im.count++;
     im.instanceMatrix.needsUpdate = true;
     im.computeBoundingSphere();
+    this.shadowDirty = true;
   }
 
   private spaceImpact(pos: THREE.Vector3, hit: boolean): void {
@@ -2512,6 +2535,8 @@ export class SeaBattleScene {
   /* ------------------------------------------------------------ public API ---- */
 
   setArena(arena: SceneArena, immediate = true): void {
+    if (arena === this.arena) return;
+    this.shadowDirty = true;
     this.arena = arena;
     const inSpace = arena === 'space';
     this.solarAudioActive = inSpace;
@@ -2884,11 +2909,17 @@ export class SeaBattleScene {
     b.pegW.count = 0;
     b.pegR.count = 0;
     marks.forEach((m, idx) => {
-      if (m === 1) this.addPeg(slot, idx, false);
-      else if (m === 2) this.addPeg(slot, idx, true);
+      if (m !== 1 && m !== 2) return;
+      const im = m === 2 ? b.pegR : b.pegW;
+      const p = this.local(idx % BOARD, Math.floor(idx / BOARD));
+      im.setMatrixAt(im.count, this.scratchMatrix.makeTranslation(p.x, m === 2 ? 0.06 : 0, p.z));
+      im.count++;
     });
     b.pegW.instanceMatrix.needsUpdate = true;
     b.pegR.instanceMatrix.needsUpdate = true;
+    b.pegW.computeBoundingSphere();
+    b.pegR.computeBoundingSphere();
+    this.shadowDirty = true;
   }
 
   /** Shows an already-sunk hull without replaying the animation. */
@@ -3080,6 +3111,7 @@ export class SeaBattleScene {
 
   /** Wipes every board for a rematch. */
   reset(): void {
+    this.shadowDirty = true;
     this.setArena('sea');
     this.boards.forEach((b, slot) => {
       b.pegW.count = 0;
@@ -3611,7 +3643,14 @@ export class SeaBattleScene {
     this.ocean.material.uniforms.uCam.value.copy(cp);
     this.sky.position.copy(cp);
 
-    this.renderer.shadowMap.needsUpdate = true;
+    const frameNow = performance.now();
+    const shadowInterval = this.highRate(frameNow) ? 1000 / 15 : 250;
+    const refreshShadow = this.shadowDirty || frameNow - this.lastShadowAt >= shadowInterval;
+    this.renderer.shadowMap.needsUpdate = refreshShadow;
+    if (refreshShadow) {
+      this.shadowDirty = false;
+      this.lastShadowAt = frameNow;
+    }
     this.renderer.render(this.scene, this.camera);
   }
 }
